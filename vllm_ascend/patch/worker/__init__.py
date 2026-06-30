@@ -59,6 +59,7 @@ except ImportError:
 import vllm_ascend.patch.worker.patch_kimi_k25  # noqa
 import vllm_ascend.patch.worker.patch_draft_quarot  # noqa
 import vllm_ascend.patch.worker.patch_eagle3_init  # noqa
+import vllm_ascend.patch.worker.patch_tree_spec_decode  # noqa
 import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_gqa_c8  # noqa

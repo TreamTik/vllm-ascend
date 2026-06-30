@@ -13,7 +13,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    get_effective_decode_threshold,
+    split_decodes_and_prefills,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -284,7 +288,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
                 split_decodes_and_prefills(
                     common_attn_metadata,
-                    decode_threshold=self.decode_threshold,
+                    decode_threshold=get_effective_decode_threshold(
+                        common_attn_metadata,
+                        self.decode_threshold,
+                    ),
                     treat_short_extends_as_decodes=False,
                 )
             )
@@ -363,7 +370,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_input_tokens = common_attn_metadata.num_input_tokens
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
-            decode_threshold=self.decode_threshold,
+            decode_threshold=get_effective_decode_threshold(
+                common_attn_metadata,
+                self.decode_threshold,
+            ),
             treat_short_extends_as_decodes=False,
         )
 

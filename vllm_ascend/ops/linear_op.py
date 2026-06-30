@@ -40,6 +40,9 @@ Row parallel op follows a similar approach - inherit from RowColumnParallelOp an
 get_row_parallel_op.
 """
 
+import json
+import os
+from contextvars import ContextVar
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -51,6 +54,7 @@ import torch_npu
 from torch import nn
 from torch.distributed import ProcessGroup
 from torch.nn.parameter import Parameter
+from vllm.forward_context import get_forward_context
 from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_reduce,
@@ -82,6 +86,46 @@ from vllm_ascend.utils import (
     oproj_tp_enable,
     shared_expert_dp_enabled,
 )
+
+_LINEAR_ISO_TRACE_ACTIVE: ContextVar[bool] = ContextVar(
+    "_LINEAR_ISO_TRACE_ACTIVE",
+    default=False,
+)
+_LINEAR_ISO_TRACE_COUNTER = 0
+
+
+def _tree_spec_decode_enabled(metadata) -> bool:
+    if metadata is None:
+        return False
+    if isinstance(metadata, dict):
+        return any(_tree_spec_decode_enabled(value) for value in metadata.values())
+    if isinstance(metadata, list):
+        return any(_tree_spec_decode_enabled(value) for value in metadata)
+    return bool(getattr(metadata, "tree_spec_decode_enabled", False))
+
+
+def _get_linear_iso_trace_path() -> str | None:
+    trace_path = os.getenv("VLLM_ASCEND_LINEAR_ISO_TRACE_PATH")
+    if not trace_path:
+        return None
+    if _LINEAR_ISO_TRACE_ACTIVE.get():
+        return None
+    try:
+        forward_context = get_forward_context()
+    except AssertionError:
+        return None
+    if forward_context is None:
+        return None
+    if getattr(forward_context, "is_draft_model", False):
+        return None
+    num_tokens = getattr(forward_context, "num_tokens", None)
+    max_num_tokens = int(os.getenv("VLLM_ASCEND_LINEAR_ISO_TRACE_MAX_NUM_TOKENS", "16"))
+    if isinstance(num_tokens, int) and num_tokens > max_num_tokens:
+        return None
+    require_tree = os.getenv("VLLM_ASCEND_LINEAR_ISO_TRACE_REQUIRE_TREE", "0") not in ("", "0", "false", "False")
+    if require_tree and not _tree_spec_decode_enabled(getattr(forward_context, "attn_metadata", None)):
+        return None
+    return trace_path
 
 
 class CustomLinearOp:
@@ -118,9 +162,75 @@ class CustomLinearOp:
     def apply_impl(self, input_):
         raise NotImplementedError
 
+    def _maybe_probe_isolated_output(self, input_: torch.Tensor, output: torch.Tensor) -> None:
+        trace_path = _get_linear_iso_trace_path()
+        if trace_path is None:
+            return
+        if not torch.is_tensor(input_) or not torch.is_tensor(output):
+            return
+        if input_.ndim == 0 or output.ndim == 0 or input_.shape[0] <= 1 or output.shape[0] <= 1:
+            return
+
+        layer_filters = [item for item in os.getenv("VLLM_ASCEND_LINEAR_ISO_TRACE_LAYERS", "").split(",") if item]
+        if layer_filters and not any(item in self.prefix for item in layer_filters):
+            return
+
+        global _LINEAR_ISO_TRACE_COUNTER
+        max_events = int(os.getenv("VLLM_ASCEND_LINEAR_ISO_TRACE_MAX_EVENTS", "256"))
+        if _LINEAR_ISO_TRACE_COUNTER >= max_events:
+            return
+
+        probe_row = max(0, int(os.getenv("VLLM_ASCEND_LINEAR_ISO_TRACE_ROW", "0")))
+        probe_row = min(probe_row, input_.shape[0] - 1, output.shape[0] - 1)
+
+        token = _LINEAR_ISO_TRACE_ACTIVE.set(True)
+        try:
+            isolated_output, _ = self.apply_impl(input_[probe_row : probe_row + 1])
+        finally:
+            _LINEAR_ISO_TRACE_ACTIVE.reset(token)
+
+        if not torch.is_tensor(isolated_output) or isolated_output.shape[0] != 1:
+            return
+
+        batched_output = output[probe_row : probe_row + 1]
+        diff = (batched_output.detach().to(torch.float32) - isolated_output.detach().to(torch.float32)).abs()
+
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return
+        input_ids = getattr(forward_context, "input_ids", None)
+        input_ids_head = None
+        if torch.is_tensor(input_ids):
+            input_ids_head = input_ids[: min(8, input_ids.shape[0])].detach().cpu().tolist()
+
+        payload = {
+            "step": _LINEAR_ISO_TRACE_COUNTER,
+            "pid": os.getpid(),
+            "layer_prefix": self.prefix,
+            "op_class": type(self).__name__,
+            "input_shape": list(input_.shape),
+            "output_shape": list(output.shape),
+            "probe_row": probe_row,
+            "input_dtype": str(input_.dtype),
+            "output_dtype": str(output.dtype),
+            "num_tokens": getattr(forward_context, "num_tokens", None),
+            "flash_comm_v1_enabled": getattr(forward_context, "flash_comm_v1_enabled", None),
+            "mmrs_fusion": getattr(forward_context, "mmrs_fusion", None),
+            "input_ids_head": input_ids_head,
+            "batched_norm": float(batched_output.detach().to(torch.float32).norm().item()),
+            "isolated_norm": float(isolated_output.detach().to(torch.float32).norm().item()),
+            "max_abs_diff": float(diff.max().item()),
+            "mean_abs_diff": float(diff.mean().item()),
+        }
+        with open(trace_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        _LINEAR_ISO_TRACE_COUNTER += 1
+
     # Replace layer.forward to customize the layer computation process.
     def apply(self, input_):
         output, output_bias = self.apply_impl(input_)
+        self._maybe_probe_isolated_output(input_, output)
         if not self.return_bias:
             return output
         return output, output_bias
@@ -151,6 +261,7 @@ class CustomRowParallelOp(CustomLinearOp):
 
     def apply(self, input_):
         output, output_bias = self.apply_impl(input_)
+        self._maybe_probe_isolated_output(input_, output)
         weight_prefetch_method = get_weight_prefetch_method()
         weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(
             weight_prefetch_method.MLP_GATE_UP, output, self.prefix

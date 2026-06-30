@@ -30,6 +30,7 @@ All speculative decoding methods are configured through the `speculative_config`
 - **`method`** (str, required): The speculative decoding method. Must be one of the supported method names listed in the table above.
 - **`num_speculative_tokens`** (int, required): Number of speculative tokens to generate per forward pass. Auto-filled from the draft model's `n_predict` config (e.g., MTP) or `suffix_decoding_max_tree_depth` (suffix method) when available.
 - **`model`** (str, optional): Path or HF repo ID for the draft model. Required for `eagle`, `eagle3`, `dflash`, `medusa`, and `draft_model`. Automatically resolved for `mtp` (reuses target model), `ngram`, `suffix`, and `extract_hidden_states`.
+- **`speculative_token_tree`** (str, optional): Tree structure for speculative token generation. The value must be a string parsable by `ast.literal_eval` into a parent-closed iterable of non-empty paths. If `num_speculative_tokens` is omitted, vLLM infers it as the number of tree nodes.
 - **`draft_tensor_parallel_size`** (int, optional): Tensor parallelism size for the draft model. Can only be `1` or the same as the target model's tensor parallel size.
 - **`disable_padded_drafter_batch`** (bool, default: `False`): Disable input padding for speculative decoding. If set to `True`, speculative input batches can contain sequences of different lengths, which may only be supported by certain attention backends. **Note:** Only effective with `eagle`, `eagle3`, `mtp`, `dflash`, `draft_model`, and `extract_hidden_states` methods.
 
@@ -57,6 +58,52 @@ vllm serve path/to/target/model \
 
 > [!NOTE]
 > On Ascend NPUs, the `npu_fused_infer_attention_score` operator supports a maximum of 16 tokens per decode round. Therefore, `(num_speculative_tokens + 1)` must be ≤ 15.
+>
+> `speculative_token_tree` is only accepted as a subfield of `speculative_config` / `--speculative-config`. There is no top-level `--speculative-token-tree` flag.
+
+## Speculating using tree-structured EAGLE drafts
+
+Tree-structured speculative decoding lets the draft model expand multiple sibling candidates per request instead of a single linear draft chain. On Ascend, the current implementation supports arbitrary branching and uneven depth trees, as long as every non-root path includes its parent path.
+
+- Offline inference
+
+    ```python
+    from vllm import LLM, SamplingParams
+
+    prompts = [
+        "Describe the image in one sentence.",
+    ]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
+
+    llm = LLM(
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        tensor_parallel_size=1,
+        enforce_eager=True,
+        speculative_config={
+            "method": "eagle3",
+            "model": "path/to/eagle3-draft-model",
+            "speculative_token_tree": "[(0,), (1,), (0, 0), (0, 1), (1, 0)]",
+        },
+    )
+
+    outputs = llm.generate(prompts, sampling_params)
+    ```
+
+- Online serving
+
+    ```shell
+    vllm serve Qwen/Qwen2.5-VL-3B-Instruct \
+      --enforce-eager \
+      --speculative-config '{"method":"eagle3","model":"path/to/eagle3-draft-model","speculative_token_tree":"[(0,), (1,), (0, 0), (0, 1), (1, 0)]"}'
+    ```
+
+The following constraints currently apply on Ascend:
+
+1. `speculative_token_tree` execution is only implemented for `eagle` and `eagle3`.
+2. Tree execution is eager-only. Graph / fullgraph execution is not supported.
+3. If `num_speculative_tokens` is also provided, it must match the number of tree nodes.
+4. LM-head tensor parallelism is not supported in tree mode yet.
+5. The current tree verifier supports greedy sampling only.
 
 ## Speculating by matching n-grams in the prompt
 

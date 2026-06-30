@@ -10,7 +10,12 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enabling_mlapo, split_decodes_and_prefills
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    enabling_mlapo,
+    get_effective_decode_threshold,
+    split_decodes_and_prefills,
+)
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -94,7 +99,10 @@ class AscendSFACPMetadataBuilder(AscendSFAMetadataBuilder):
         metadata_cls = super().build(common_prefix_len, common_attn_metadata, fast_build)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata,
-            decode_threshold=self.decode_threshold,
+            decode_threshold=get_effective_decode_threshold(
+                common_attn_metadata,
+                self.decode_threshold,
+            ),
             treat_short_extends_as_decodes=False,
         )
         num_reqs = common_attn_metadata.num_reqs

@@ -189,6 +189,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
     kvcomp_metadata: KVCompMetaData | None = None
+    tree_spec_decode_enabled: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -221,6 +222,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
+            tree_spec_decode_enabled=self.tree_spec_decode_enabled,
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
             else None,
@@ -243,6 +245,23 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
         )
+
+
+def get_effective_decode_threshold(
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    decode_threshold: int,
+) -> int:
+    """Return the decode threshold that should be used for this batch.
+
+    Tree speculative target verification uses multi-token query batches to
+    represent sibling branches. Ascend short-extend decode fast paths assume a
+    linear causal extension and can bypass the custom tree mask, so tree
+    batches must be forced back onto the masked prefill-style path by treating
+    only single-token requests as decodes.
+    """
+    if common_attn_metadata.tree_spec_decode_enabled:
+        return 1
+    return decode_threshold
 
 
 def filter_chunked_req_indices(

@@ -71,6 +71,7 @@ def set_ascend_forward_context(
     draft_attn_metadatas=None,
     has_sinks=False,
     input_ids=None,
+    positions=None,
     eplb_heat_collection_status: bool = False,
 ):
     """A context manager that stores the current forward context,
@@ -91,6 +92,7 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+        forward_context.positions = positions
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -358,6 +360,8 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        "input_ids",
+        "positions",
     )
 
     def check_extra_attr(self, name: str):

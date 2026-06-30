@@ -29,6 +29,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     enabling_mlapo,
+    get_effective_decode_threshold,
     maybe_save_kv_layer_to_connector,
     notify_kv_cache_written,
     split_decodes_and_prefills,
@@ -438,12 +439,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=common_attn_metadata.prefill_context_parallel_metadata is None,
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=get_effective_decode_threshold(
+                        common_attn_metadata,
+                        self.decode_threshold,
+                    ),
+                    treat_short_extends_as_decodes=common_attn_metadata.prefill_context_parallel_metadata is None,
+                )
             )
-        )
         self.set_num_actual_tokens(common_attn_metadata)
         assert self.num_decodes + self.num_prefills == num_reqs
         assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens

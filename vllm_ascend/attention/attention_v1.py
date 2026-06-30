@@ -17,6 +17,9 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import json
+import os
+import time
 
 import torch
 import torch_npu
@@ -47,9 +50,22 @@ from vllm_ascend.attention.kvcomp_attn.attention_utils import (
     is_enable_hamming_sparse,
     reshape_and_cache_kvcomp,
 )
+from vllm_ascend.attention.tree_attention import (
+    build_tree_split_plan,
+    build_tree_paged_plan,
+    gather_paged_kv_to_ragged,
+    merge_split_tree_attention_outputs,
+    maybe_dump_tree_exact_debug,
+    resolve_tree_fast_impl,
+    run_fast_tree_attention,
+    run_fast_tree_attention_from_paged_cache,
+    run_exact_tree_attention,
+    run_split_current_tree_attention,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     enable_cp,
+    get_effective_decode_threshold,
     notify_kv_cache_written,
     split_decodes_and_prefills,
     using_paged_attention,
@@ -70,6 +86,94 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_TREE_ATTN_TRACE_COUNT = 0
+_PREFIX_CACHE_TRACE_COUNT = 0
+_TREE_FAST_PROFILE_COUNT = 0
+_TREE_SPLIT_COMPARE_COUNT = 0
+
+
+def _maybe_dump_tree_attn_trace(
+    *,
+    layer_name: str | None,
+    impl_name: str,
+    path: str,
+    attn_metadata,
+    extra: dict | None = None,
+) -> None:
+    trace_path = os.getenv("VLLM_ASCEND_TREE_ATTN_TRACE_PATH")
+    if not trace_path:
+        return
+
+    global _TREE_ATTN_TRACE_COUNT
+    max_steps = int(os.getenv("VLLM_ASCEND_TREE_ATTN_TRACE_STEPS", "256"))
+    if _TREE_ATTN_TRACE_COUNT >= max_steps:
+        return
+
+    payload = {
+        "index": _TREE_ATTN_TRACE_COUNT,
+        "pid": os.getpid(),
+        "layer_name": layer_name,
+        "impl_name": impl_name,
+        "path": path,
+        "tree_spec_decode_enabled": getattr(attn_metadata, "tree_spec_decode_enabled", None),
+        "attn_state": getattr(getattr(attn_metadata, "attn_state", None), "name", None),
+        "num_actual_tokens": getattr(attn_metadata, "num_actual_tokens", None),
+        "actual_seq_lengths_q": getattr(attn_metadata, "actual_seq_lengths_q", None),
+        "seq_lens_list": getattr(attn_metadata, "seq_lens_list", None),
+        "block_tables_present": getattr(attn_metadata, "block_tables", None) is not None,
+    }
+    if extra:
+        payload.update(extra)
+    with open(trace_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    _TREE_ATTN_TRACE_COUNT += 1
+
+
+def _maybe_dump_tree_fast_profile(payload: dict) -> None:
+    trace_path = os.getenv("VLLM_ASCEND_TREE_FAST_PROFILE_PATH")
+    if not trace_path or get_tensor_model_parallel_rank() != 0:
+        return
+
+    global _TREE_FAST_PROFILE_COUNT
+    max_steps = int(os.getenv("VLLM_ASCEND_TREE_FAST_PROFILE_STEPS", "128"))
+    if _TREE_FAST_PROFILE_COUNT >= max_steps:
+        return
+
+    data = dict(payload)
+    data["index"] = _TREE_FAST_PROFILE_COUNT
+    data["pid"] = os.getpid()
+    with open(trace_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(data, ensure_ascii=False) + "\n")
+    _TREE_FAST_PROFILE_COUNT += 1
+
+
+def _maybe_dump_tree_split_compare(payload: dict) -> None:
+    trace_path = os.getenv("VLLM_ASCEND_TREE_SPLIT_COMPARE_PATH")
+    if not trace_path or get_tensor_model_parallel_rank() != 0:
+        return
+
+    global _TREE_SPLIT_COMPARE_COUNT
+    max_steps = int(os.getenv("VLLM_ASCEND_TREE_SPLIT_COMPARE_STEPS", "16"))
+    if _TREE_SPLIT_COMPARE_COUNT >= max_steps:
+        return
+
+    data = dict(payload)
+    data["index"] = _TREE_SPLIT_COMPARE_COUNT
+    data["pid"] = os.getpid()
+    with open(trace_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(data, ensure_ascii=False) + "\n")
+    _TREE_SPLIT_COMPARE_COUNT += 1
+
+
+def _matches_trace_filters(layer_name: str | None, filter_spec: str | None) -> bool:
+    if not filter_spec:
+        return True
+    if layer_name is None:
+        return False
+    filters = [item.strip() for item in filter_spec.split(",") if item.strip()]
+    if not filters:
+        return True
+    return any(item in layer_name for item in filters)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -210,6 +314,11 @@ class AscendMetadata:
     reshape_cache_event: torch.npu.Event = None
 
     kvcomp_metadata: KVCompMetaData | None = None
+    tree_spec_decode_enabled: bool = False
+    tree_fast_non_root_plan: object | None = None
+    tree_fast_non_root_plan_key: tuple[object, ...] | None = None
+    tree_fast_all_rows_plan: object | None = None
+    tree_fast_mixed_batch_fallback: bool = False
 
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
@@ -282,7 +391,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
-            common_attn_metadata, decode_threshold=self.decode_threshold
+            common_attn_metadata,
+            decode_threshold=get_effective_decode_threshold(
+                common_attn_metadata,
+                self.decode_threshold,
+            ),
         )
 
         block_table = common_attn_metadata.block_table_tensor
@@ -366,6 +479,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
             kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
+            tree_spec_decode_enabled=common_attn_metadata.tree_spec_decode_enabled,
         )
         return attn_metadata
 
@@ -1082,12 +1196,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
     def forward_fused_infer_attention(
         self,
+        layer: AttentionLayer | None,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
         kv_cache=None,
+        trace_source: str = "decode_fused",
     ):
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
@@ -1111,6 +1227,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table, actual_seq_lengths_kv = get_kvcomp_decode_params(
                 self.layerIndex, attn_metadata.kvcomp_metadata, query, passed_key, block_table, actual_seq_lengths_kv
             )
+        if (
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and attn_metadata.block_tables is not None
+            and attn_metadata.seq_lens_list is not None
+        ):
+            decode_trace_metadata = self._build_decode_cache_trace_metadata(attn_metadata)
+        else:
+            decode_trace_metadata = None
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if (
@@ -1198,14 +1322,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        if decode_trace_metadata is not None:
+            self._maybe_dump_prefix_cache_trace(
+                layer=layer,
+                query=query,
+                attn_metadata=decode_trace_metadata,
+                trace_source=trace_source,
+                attn_output=attn_output,
+            )
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
     def forward_paged_attention(
         self,
+        layer: AttentionLayer | None,
         query: torch.Tensor,
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
+        trace_source: str = "decode_paged",
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
@@ -1219,6 +1353,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table=attn_metadata.block_tables,
             context_lens=attn_metadata.seq_lens,
             out=output,
+        )
+        self._maybe_dump_prefix_cache_trace(
+            layer=layer,
+            query=query,
+            attn_metadata=attn_metadata,
+            trace_source=trace_source,
+            attn_output=output,
         )
         return output
 
@@ -1296,6 +1437,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
     def forward_impl(
         self,
+        layer: AttentionLayer | None,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -1310,11 +1452,919 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and using_paged_attention(num_tokens, self.vllm_config)
             and self.sliding_window is None
         ):
-            output = self.forward_paged_attention(query, attn_metadata, output)
+            output = self.forward_paged_attention(layer, query, attn_metadata, output)
         else:
-            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
+            output = self.forward_fused_infer_attention(
+                layer,
+                query,
+                key,
+                value,
+                attn_metadata,
+                output,
+                kv_cache,
+            )
 
         return output
+
+    def _should_use_tree_exact_attention(self, attn_metadata: AscendMetadata) -> bool:
+        return (
+            attn_metadata.tree_spec_decode_enabled
+            and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
+            and attn_metadata.block_tables is not None
+            and attn_metadata.causal
+            and not enable_cp()
+            and self.sliding_window is None
+            and self.sinks is None
+            and not getattr(self, "enable_hamming_sparse", False)
+            and self.attn_type != AttentionType.ENCODER_DECODER
+        )
+
+    def _gather_paged_kv_to_ragged(
+        self,
+        block_tables: torch.Tensor,
+        seq_lens: list[int],
+        target_dtype: torch.dtype,
+        layer: AttentionLayer | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del target_dtype, layer
+        if self.key_cache is None or self.value_cache is None:
+            raise RuntimeError("tree exact attention requires initialized KV cache")
+        return gather_paged_kv_to_ragged(self.key_cache, self.value_cache, block_tables, seq_lens)
+
+    def _maybe_dump_prefix_cache_trace(
+        self,
+        *,
+        layer: AttentionLayer | None,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        trace_source: str,
+        attn_output: torch.Tensor | None = None,
+    ) -> None:
+        trace_path = os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_PATH")
+        if not trace_path or get_tensor_model_parallel_rank() != 0:
+            return
+
+        layer_name = getattr(layer, "layer_name", None)
+        if not _matches_trace_filters(layer_name, os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_LAYERS")):
+            return
+
+        source_filters = os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_SOURCES")
+        if source_filters:
+            allowed_sources = {item.strip() for item in source_filters.split(",") if item.strip()}
+            if allowed_sources and trace_source not in allowed_sources:
+                return
+
+        global _PREFIX_CACHE_TRACE_COUNT
+        max_steps = int(os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_STEPS", "32"))
+        if _PREFIX_CACHE_TRACE_COUNT >= max_steps:
+            return
+
+        if attn_metadata.block_tables is None or not attn_metadata.actual_seq_lengths_q:
+            return
+
+        batch_size = len(attn_metadata.actual_seq_lengths_q)
+        seq_lens = attn_metadata.seq_lens_list[:batch_size]
+        gathered_key, gathered_value = self._gather_paged_kv_to_ragged(
+            attn_metadata.block_tables,
+            seq_lens,
+            query.dtype,
+            layer,
+        )
+
+        block_size = self.vllm_config.cache_config.block_size
+        head_dim = max(1, int(os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_HEAD", "8")))
+        prefix_tail = max(1, int(os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_TAIL", "4")))
+        current_input_ids = getattr(_EXTRA_CTX, "input_ids", None)
+        current_input_positions = getattr(_EXTRA_CTX, "positions", None)
+
+        def _vector_head(tensor: torch.Tensor) -> list[float]:
+            return tensor[:head_dim].detach().to(torch.float32).cpu().tolist()
+
+        def _slot_id_for_position(req_index: int, position: int) -> int:
+            block_index = int(attn_metadata.block_tables[req_index, position // block_size].item())
+            return block_index * block_size + (position % block_size)
+
+        def _serialize_row_slice(value, start: int, end: int):
+            if value is None:
+                return None
+            try:
+                sliced = value[start:end]
+            except Exception:
+                return None
+            if isinstance(sliced, torch.Tensor):
+                return sliced.detach().cpu().tolist()
+            try:
+                return torch.as_tensor(sliced).detach().cpu().tolist()
+            except Exception:
+                try:
+                    return list(sliced)
+                except Exception:
+                    return None
+
+        requests = []
+        q_start = 0
+        kv_start = 0
+        for req_idx, q_end in enumerate(attn_metadata.actual_seq_lengths_q):
+            q_len = q_end - q_start
+            seq_len = seq_lens[req_idx]
+            prefix_len = seq_len - q_len
+            query_req = query[q_start:q_end]
+            output_req = attn_output[q_start:q_end] if attn_output is not None else None
+            gathered_k_req = gathered_key[kv_start : kv_start + seq_len]
+            gathered_v_req = gathered_value[kv_start : kv_start + seq_len]
+            current_k_req = gathered_k_req[prefix_len:seq_len]
+            current_v_req = gathered_v_req[prefix_len:seq_len]
+            prefix_tail_positions = list(range(max(0, prefix_len - prefix_tail), prefix_len))
+
+            req_payload = {
+                "request_index": req_idx,
+                "q_len": q_len,
+                "seq_len": seq_len,
+                "prefix_len": prefix_len,
+                "current_positions": list(range(prefix_len, seq_len)),
+                "current_input_ids": _serialize_row_slice(current_input_ids, q_start, q_end),
+                "current_input_positions": _serialize_row_slice(current_input_positions, q_start, q_end),
+                "current_slots": (
+                    attn_metadata.slot_mapping[q_start:q_end].detach().cpu().tolist()
+                    if attn_metadata.slot_mapping is not None
+                    else None
+                ),
+                "prefix_tail_positions": prefix_tail_positions,
+                "prefix_tail_slots": [_slot_id_for_position(req_idx, position) for position in prefix_tail_positions],
+                "prefix_tail_k_heads": [_vector_head(gathered_k_req[position, 0]) for position in prefix_tail_positions],
+                "prefix_tail_v_heads": [_vector_head(gathered_v_req[position, 0]) for position in prefix_tail_positions],
+                "prefix_last_k_head": (_vector_head(gathered_k_req[prefix_len - 1, 0]) if prefix_len > 0 else None),
+                "prefix_last_v_head": (_vector_head(gathered_v_req[prefix_len - 1, 0]) if prefix_len > 0 else None),
+                "current_q_heads": [_vector_head(query_req[row_idx, 0]) for row_idx in range(q_len)],
+                "current_k_heads": [_vector_head(current_k_req[row_idx, 0]) for row_idx in range(q_len)],
+                "current_v_heads": [_vector_head(current_v_req[row_idx, 0]) for row_idx in range(q_len)],
+                "current_output_heads": (
+                    [_vector_head(output_req[row_idx, 0]) for row_idx in range(q_len)] if output_req is not None else None
+                ),
+            }
+            requests.append(req_payload)
+            q_start = q_end
+            kv_start += seq_len
+
+        payload = {
+            "step": _PREFIX_CACHE_TRACE_COUNT,
+            "pid": os.getpid(),
+            "tp_rank": get_tensor_model_parallel_rank(),
+            "label": os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_LABEL"),
+            "trace_source": trace_source,
+            "layer_name": layer_name,
+            "attn_state": getattr(getattr(attn_metadata, "attn_state", None), "name", None),
+            "tree_spec_decode_enabled": getattr(attn_metadata, "tree_spec_decode_enabled", None),
+            "num_actual_tokens": getattr(attn_metadata, "num_actual_tokens", None),
+            "requests": requests,
+        }
+        with open(trace_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        _PREFIX_CACHE_TRACE_COUNT += 1
+
+    def _build_tree_root_decode_metadata(
+        self,
+        attn_metadata: AscendMetadata,
+        active_req_indices: list[int],
+        root_seq_lens: list[int],
+        row0_slot_mapping: torch.Tensor | None = None,
+    ) -> AscendMetadata:
+        decode_metadata = AscendMetadata()
+        device = attn_metadata.seq_lens.device
+        mask_builder = AttentionMaskBuilder(device)
+        decode_metadata.attn_state = AscendAttentionState.DecodeOnly
+        decode_metadata.block_tables = attn_metadata.block_tables[active_req_indices]
+        decode_metadata.seq_lens = torch.tensor(
+            root_seq_lens,
+            dtype=attn_metadata.seq_lens.dtype,
+            device=device,
+        )
+        decode_metadata.seq_lens_cpu = decode_metadata.seq_lens
+        decode_metadata.seq_lens_list = root_seq_lens
+        decode_metadata.actual_seq_lengths_q = list(range(1, len(active_req_indices) + 1))
+        decode_metadata.query_start_loc = torch.arange(
+            len(active_req_indices) + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        decode_metadata.max_query_len = 1
+        decode_metadata.slot_mapping = row0_slot_mapping
+        decode_metadata.attn_mask = mask_builder.get_attention_mask(
+            attn_metadata.causal,
+            self.vllm_config.model_config,
+        )
+        decode_metadata.causal = attn_metadata.causal
+        decode_metadata.tree_spec_decode_enabled = False
+        decode_metadata.num_actual_tokens = len(root_seq_lens)
+        decode_metadata.num_decode_tokens = len(root_seq_lens)
+        decode_metadata.num_decodes = len(root_seq_lens)
+        decode_metadata.num_prefills = 0
+        return decode_metadata
+
+    def _build_decode_cache_trace_metadata(self, attn_metadata: AscendMetadata) -> AscendMetadata:
+        trace_metadata = AscendMetadata()
+        trace_metadata.attn_state = AscendAttentionState.DecodeOnly
+        trace_metadata.block_tables = attn_metadata.block_tables
+        trace_metadata.seq_lens = attn_metadata.seq_lens
+        trace_metadata.seq_lens_cpu = attn_metadata.seq_lens_cpu
+        trace_metadata.seq_lens_list = attn_metadata.seq_lens_list
+        trace_metadata.actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        trace_metadata.slot_mapping = attn_metadata.slot_mapping
+        trace_metadata.causal = attn_metadata.causal
+        trace_metadata.tree_spec_decode_enabled = attn_metadata.tree_spec_decode_enabled
+        trace_metadata.num_actual_tokens = attn_metadata.num_actual_tokens
+        return trace_metadata
+
+    def forward_tree_exact_attention(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        current_key = key[:num_tokens]
+        current_value = value[:num_tokens]
+        batch_size = len(attn_metadata.actual_seq_lengths_q)
+        seq_lens = attn_metadata.seq_lens_list[:batch_size]
+        tree_mask = attn_metadata.attn_mask
+        max_q_len = max(
+            q_end - (attn_metadata.actual_seq_lengths_q[idx - 1] if idx > 0 else 0)
+            for idx, q_end in enumerate(attn_metadata.actual_seq_lengths_q)
+        )
+        if tree_mask is None or tree_mask.shape[0] < max_q_len or tree_mask.shape[1] < max_q_len:
+            raise RuntimeError("tree exact attention requires a tree-specific attention mask")
+
+        gathered_key, gathered_value = self._gather_paged_kv_to_ragged(
+            attn_metadata.block_tables,
+            seq_lens,
+            query.dtype,
+            layer,
+        )
+        attn_output = run_exact_tree_attention(
+            query=query,
+            key=gathered_key,
+            value=gathered_value,
+            seq_lens=seq_lens,
+            actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+            tree_mask=tree_mask,
+            scale=self.scale,
+            num_queries_per_kv=self.num_queries_per_kv,
+        )
+
+        row0_token_indices: list[int] = []
+        active_req_indices: list[int] = []
+        root_seq_lens: list[int] = []
+        q_start = 0
+        for req_idx, q_end in enumerate(attn_metadata.actual_seq_lengths_q):
+            q_len = q_end - q_start
+            if q_len > 0:
+                active_req_indices.append(req_idx)
+                row0_token_indices.append(q_start)
+                root_seq_lens.append(seq_lens[req_idx] - q_len + 1)
+            q_start = q_end
+
+        if active_req_indices:
+            row0_query = query[row0_token_indices]
+            row0_key = current_key[row0_token_indices]
+            row0_value = current_value[row0_token_indices]
+            row0_output = torch.empty_like(row0_query)
+            row0_slot_mapping = (
+                attn_metadata.slot_mapping[row0_token_indices]
+                if attn_metadata.slot_mapping is not None
+                else None
+            )
+            row0_metadata = self._build_tree_root_decode_metadata(
+                attn_metadata,
+                active_req_indices,
+                root_seq_lens,
+                row0_slot_mapping,
+            )
+            if (
+                row0_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and using_paged_attention(row0_query.shape[0], self.vllm_config)
+                and self.sliding_window is None
+            ):
+                self.forward_paged_attention(
+                    layer,
+                    row0_query,
+                    row0_metadata,
+                    row0_output,
+                    trace_source="tree_row0_paged",
+                )
+            else:
+                self.forward_fused_infer_attention(
+                    layer,
+                    row0_query,
+                    row0_key,
+                    row0_value,
+                    row0_metadata,
+                    row0_output,
+                    trace_source="tree_row0_fused",
+                )
+            attn_output[row0_token_indices] = row0_output
+
+        debug_path = os.getenv("VLLM_ASCEND_TREE_EXACT_DEBUG_PATH")
+        if debug_path:
+            q_start = 0
+            kv_start = 0
+            current_start = 0
+            debug_rows = []
+            block_size = self.vllm_config.cache_config.block_size
+            debug_tail = max(1, int(os.getenv("VLLM_ASCEND_TREE_EXACT_DEBUG_TAIL", "3")))
+            debug_head = max(
+                1,
+                int(
+                    os.getenv(
+                        "VLLM_ASCEND_TREE_EXACT_DEBUG_HEAD",
+                        os.getenv("VLLM_ASCEND_PREFIX_CACHE_TRACE_HEAD", "8"),
+                    )
+                ),
+            )
+
+            def _vector_head(tensor: torch.Tensor, *, limit: int = debug_head) -> list[float]:
+                return tensor[:limit].detach().to(torch.float32).cpu().tolist()
+
+            def _slot_id_for_position(req_index: int, position: int) -> int:
+                block_index = int(attn_metadata.block_tables[req_index, position // block_size].item())
+                return block_index * block_size + (position % block_size)
+
+            for req_idx, q_end in enumerate(attn_metadata.actual_seq_lengths_q):
+                q_len = q_end - q_start
+                seq_len = seq_lens[req_idx]
+                prefix_len = seq_len - q_len
+                gathered_k_req = gathered_key[kv_start : kv_start + seq_len]
+                gathered_v_req = gathered_value[kv_start : kv_start + seq_len]
+                direct_k_req = current_key[current_start : current_start + q_len]
+                direct_v_req = current_value[current_start : current_start + q_len]
+                gathered_cur_k = gathered_k_req[prefix_len:seq_len]
+                gathered_cur_v = gathered_v_req[prefix_len:seq_len]
+
+                req_payload = {
+                    "request_index": req_idx,
+                    "q_len": q_len,
+                    "seq_len": seq_len,
+                    "prefix_len": prefix_len,
+                    "current_slots": attn_metadata.slot_mapping[q_start:q_end].detach().cpu().tolist(),
+                    "current_k_max_diff": float((gathered_cur_k - direct_k_req).abs().max().item()),
+                    "current_v_max_diff": float((gathered_cur_v - direct_v_req).abs().max().item()),
+                }
+
+                if prefix_len > 0:
+                    prefix_tail_positions = list(range(max(0, prefix_len - debug_tail), prefix_len))
+                    req_payload["prefix_tail_slots"] = [
+                        _slot_id_for_position(req_idx, position) for position in prefix_tail_positions
+                    ]
+                    req_payload["prefix_tail_k_heads"] = [
+                        _vector_head(gathered_k_req[position, 0]) for position in prefix_tail_positions
+                    ]
+                    req_payload["prefix_tail_v_heads"] = [
+                        _vector_head(gathered_v_req[position, 0]) for position in prefix_tail_positions
+                    ]
+                    req_payload["prefix_last_k_head"] = _vector_head(gathered_k_req[prefix_len - 1, 0])
+                    req_payload["prefix_last_v_head"] = _vector_head(gathered_v_req[prefix_len - 1, 0])
+                else:
+                    req_payload["prefix_tail_slots"] = []
+                    req_payload["prefix_tail_k_heads"] = []
+                    req_payload["prefix_tail_v_heads"] = []
+                    req_payload["prefix_last_k_head"] = None
+                    req_payload["prefix_last_v_head"] = None
+
+                req_payload["current_k_heads"] = [
+                    _vector_head(direct_k_req[row_idx, 0]) for row_idx in range(q_len)
+                ]
+                req_payload["current_v_heads"] = [
+                    _vector_head(direct_v_req[row_idx, 0]) for row_idx in range(q_len)
+                ]
+                req_payload["current_q_heads"] = [
+                    _vector_head(query[q_start + row_idx, 0]) for row_idx in range(q_len)
+                ]
+                req_payload["current_output_heads"] = [
+                    _vector_head(attn_output[q_start + row_idx, 0]) for row_idx in range(q_len)
+                ]
+
+                if q_len > 0:
+                    row0_key = torch.cat((gathered_k_req[:prefix_len], direct_k_req[:1]), dim=0)
+                    row0_value = torch.cat((gathered_v_req[:prefix_len], direct_v_req[:1]), dim=0)
+                    row0_only_output = run_exact_tree_attention(
+                        query=query[q_start : q_start + 1],
+                        key=row0_key,
+                        value=row0_value,
+                        seq_lens=[prefix_len + 1],
+                        actual_seq_lengths_q=[1],
+                        tree_mask=torch.zeros((1, 1), dtype=tree_mask.dtype, device=tree_mask.device),
+                        scale=self.scale,
+                        num_queries_per_kv=self.num_queries_per_kv,
+                    )
+                    req_payload["row0_output_max_diff_vs_isolated"] = float(
+                        (attn_output[q_start : q_start + 1] - row0_only_output).abs().max().item()
+                    )
+                debug_rows.append(req_payload)
+
+                q_start = q_end
+                kv_start += seq_len
+                current_start += q_len
+
+            maybe_dump_tree_exact_debug(
+                {
+                    "pid": os.getpid(),
+                    "tp_rank": get_tensor_model_parallel_rank(),
+                    "layer_name": getattr(layer, "layer_name", None),
+                    "rows": debug_rows,
+                }
+            )
+        output[:num_tokens] = attn_output[:num_tokens]
+        return output
+
+    def _build_tree_non_root_indices(
+        self,
+        actual_seq_lengths_q: list[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        indices: list[int] = []
+        q_start = 0
+        for q_end in actual_seq_lengths_q:
+            q_len = q_end - q_start
+            if q_len > 1:
+                indices.extend(range(q_start + 1, q_end))
+            q_start = q_end
+        return torch.tensor(indices, dtype=torch.long, device=device)
+
+    def _run_tree_row0_override(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        seq_lens: list[int],
+        output: torch.Tensor,
+    ) -> tuple[list[int], float]:
+        row0_token_indices: list[int] = []
+        active_req_indices: list[int] = []
+        root_seq_lens: list[int] = []
+        q_start = 0
+        for req_idx, q_end in enumerate(attn_metadata.actual_seq_lengths_q):
+            q_len = q_end - q_start
+            if q_len > 0:
+                active_req_indices.append(req_idx)
+                row0_token_indices.append(q_start)
+                root_seq_lens.append(seq_lens[req_idx] - q_len + 1)
+            q_start = q_end
+
+        if not active_req_indices:
+            return row0_token_indices, 0.0
+
+        row0_start = time.perf_counter()
+        row0_query = query[row0_token_indices]
+        row0_key = current_key[row0_token_indices]
+        row0_value = current_value[row0_token_indices]
+        row0_output = torch.empty_like(row0_query)
+        row0_slot_mapping = (
+            attn_metadata.slot_mapping[row0_token_indices] if attn_metadata.slot_mapping is not None else None
+        )
+        row0_metadata = self._build_tree_root_decode_metadata(
+            attn_metadata,
+            active_req_indices,
+            root_seq_lens,
+            row0_slot_mapping,
+        )
+        if (
+            row0_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and using_paged_attention(row0_query.shape[0], self.vllm_config)
+            and self.sliding_window is None
+        ):
+            self.forward_paged_attention(
+                layer,
+                row0_query,
+                row0_metadata,
+                row0_output,
+                trace_source="tree_row0_paged",
+            )
+        else:
+            self.forward_fused_infer_attention(
+                layer,
+                row0_query,
+                row0_key,
+                row0_value,
+                row0_metadata,
+                row0_output,
+                trace_source="tree_row0_fused",
+            )
+        output[row0_token_indices] = row0_output
+        return row0_token_indices, (time.perf_counter() - row0_start) * 1000.0
+
+    def _get_or_build_tree_non_root_plan(
+        self,
+        attn_metadata: AscendMetadata,
+        seq_lens: list[int],
+        tree_mask: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[object, float]:
+        if attn_metadata.tree_fast_non_root_plan is not None:
+            return attn_metadata.tree_fast_non_root_plan, 0.0
+
+        if self.key_cache is None or attn_metadata.block_tables is None:
+            raise RuntimeError("tree fast attention requires initialized KV cache and block tables")
+
+        plan_start = time.perf_counter()
+        plan_key = (
+            int(attn_metadata.block_tables.data_ptr()),
+            tuple(seq_lens),
+            tuple(attn_metadata.actual_seq_lengths_q),
+            int(tree_mask.data_ptr()),
+            int(self.key_cache.shape[1]),
+            str(device),
+        )
+        cached_plan = attn_metadata.tree_fast_non_root_plan
+        if attn_metadata.tree_fast_non_root_plan_key != plan_key or cached_plan is None:
+            cached_plan = build_tree_paged_plan(
+                block_tables=attn_metadata.block_tables,
+                seq_lens=seq_lens,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                tree_mask=tree_mask,
+                device=device,
+                block_size=self.key_cache.shape[1],
+            )
+            attn_metadata.tree_fast_non_root_plan = cached_plan
+            attn_metadata.tree_fast_non_root_plan_key = plan_key
+        return cached_plan, (time.perf_counter() - plan_start) * 1000.0
+
+    def _get_or_build_tree_all_rows_plan(
+        self,
+        attn_metadata: AscendMetadata,
+        seq_lens: list[int],
+        tree_mask: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[object, float]:
+        if attn_metadata.tree_fast_all_rows_plan is not None:
+            return attn_metadata.tree_fast_all_rows_plan, 0.0
+
+        if self.key_cache is None or attn_metadata.block_tables is None:
+            raise RuntimeError("tree fast attention requires initialized KV cache and block tables")
+
+        plan_start = time.perf_counter()
+        cached_plan = build_tree_paged_plan(
+            block_tables=attn_metadata.block_tables,
+            seq_lens=seq_lens,
+            actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+            tree_mask=tree_mask,
+            device=device,
+            block_size=self.key_cache.shape[1],
+            include_row0=True,
+        )
+        attn_metadata.tree_fast_all_rows_plan = cached_plan
+        return cached_plan, (time.perf_counter() - plan_start) * 1000.0
+
+    def _get_tree_cache_fia_tensors(self) -> tuple[torch.Tensor, torch.Tensor, int]:
+        if self.key_cache is None or self.value_cache is None:
+            raise RuntimeError("tree fast attention requires initialized KV cache")
+        num_block, block_size, _, _ = self.key_cache.shape
+        return self.key_cache.view(num_block, block_size, -1), self.value_cache.view(num_block, block_size, -1), block_size
+
+    def _forward_tree_fast_attention_legacy(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        seq_lens: list[int],
+        tree_mask: torch.Tensor,
+        total_start: float,
+    ) -> torch.Tensor:
+        row0_token_indices, row0_ms = self._run_tree_row0_override(
+            layer,
+            query,
+            current_key,
+            current_value,
+            attn_metadata,
+            seq_lens,
+            output,
+        )
+
+        non_root_plan, non_root_plan_ms = self._get_or_build_tree_non_root_plan(
+            attn_metadata,
+            seq_lens,
+            tree_mask,
+            query.device,
+        )
+
+        non_root_start = time.perf_counter()
+        non_root_indices, non_root_output, non_root_stats = run_fast_tree_attention_from_paged_cache(
+            query=query,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            plan=non_root_plan,
+            scale=self.scale,
+            num_queries_per_kv=self.num_queries_per_kv,
+        )
+        non_root_ms = (time.perf_counter() - non_root_start) * 1000.0
+        if non_root_indices.numel() > 0:
+            output[non_root_indices] = non_root_output[: non_root_indices.numel()]
+        _maybe_dump_tree_fast_profile(
+            {
+                "layer_name": getattr(layer, "layer_name", None),
+                "num_tokens": query.shape[0],
+                "seq_lens_list": seq_lens,
+                "actual_seq_lengths_q": attn_metadata.actual_seq_lengths_q,
+                "row0_count": len(row0_token_indices),
+                "non_root_count": int(non_root_indices.numel()),
+                "gather_ms": 0.0,
+                "row0_ms": row0_ms,
+                "non_root_ms": non_root_ms,
+                "total_ms": (time.perf_counter() - total_start) * 1000.0,
+                "tree_impl": "batched_legacy",
+                "non_root_stats": {
+                    **non_root_stats,
+                    "plan_ms": non_root_plan_ms,
+                },
+            }
+        )
+        return output
+
+    def _forward_tree_fast_attention_all_rows(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        seq_lens: list[int],
+        tree_mask: torch.Tensor,
+        total_start: float,
+    ) -> torch.Tensor:
+        del current_key, current_value
+        all_rows_plan, plan_ms = self._get_or_build_tree_all_rows_plan(
+            attn_metadata,
+            seq_lens,
+            tree_mask,
+            query.device,
+        )
+
+        all_rows_start = time.perf_counter()
+        output_indices, attn_output, attn_stats = run_fast_tree_attention_from_paged_cache(
+            query=query,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            plan=all_rows_plan,
+            scale=self.scale,
+            num_queries_per_kv=self.num_queries_per_kv,
+        )
+        all_rows_ms = (time.perf_counter() - all_rows_start) * 1000.0
+        if output_indices.numel() > 0:
+            output[output_indices] = attn_output[: output_indices.numel()]
+        _maybe_dump_tree_fast_profile(
+            {
+                "layer_name": getattr(layer, "layer_name", None),
+                "num_tokens": query.shape[0],
+                "seq_lens_list": seq_lens,
+                "actual_seq_lengths_q": attn_metadata.actual_seq_lengths_q,
+                "row0_count": len(attn_metadata.actual_seq_lengths_q),
+                "non_root_count": int(output_indices.numel()),
+                "gather_ms": 0.0,
+                "row0_ms": 0.0,
+                "non_root_ms": all_rows_ms,
+                "total_ms": (time.perf_counter() - total_start) * 1000.0,
+                "tree_impl": "batched",
+                "all_rows_unified": True,
+                "non_root_stats": {
+                    **attn_stats,
+                    "plan_ms": plan_ms,
+                },
+            }
+        )
+        return output
+
+    def _forward_tree_fast_attention_split(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        current_value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        seq_lens: list[int],
+        tree_mask: torch.Tensor,
+        total_start: float,
+    ) -> torch.Tensor:
+        row0_token_indices, row0_ms = self._run_tree_row0_override(
+            layer,
+            query,
+            current_key,
+            current_value,
+            attn_metadata,
+            seq_lens,
+            output,
+        )
+
+        plan, plan_stats = build_tree_split_plan(
+            actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+            seq_lens=seq_lens,
+            tree_mask=tree_mask,
+            block_tables=attn_metadata.block_tables,
+            device=query.device,
+        )
+        if plan.num_rows == 0:
+            _maybe_dump_tree_fast_profile(
+                {
+                    "layer_name": getattr(layer, "layer_name", None),
+                    "num_tokens": query.shape[0],
+                    "seq_lens_list": seq_lens,
+                    "actual_seq_lengths_q": attn_metadata.actual_seq_lengths_q,
+                    "row0_count": len(row0_token_indices),
+                    "non_root_count": 0,
+                    "gather_ms": 0.0,
+                    "row0_ms": row0_ms,
+                    "non_root_ms": 0.0,
+                    "total_ms": (time.perf_counter() - total_start) * 1000.0,
+                    "tree_impl": "batched_split",
+                }
+            )
+            return output
+
+        packed_query = query.index_select(0, plan.output_indices).contiguous()
+
+        prefix_start = time.perf_counter()
+        cache_key, cache_value, block_size = self._get_tree_cache_fia_tensors()
+        prefix_output, prefix_lse = torch_npu.npu_fused_infer_attention_score(
+            query=packed_query,
+            key=cache_key,
+            value=cache_value,
+            block_table=plan.prefix_block_tables,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_lengths=plan.actual_seq_lengths_q,
+            actual_seq_lengths_kv=plan.prefix_actual_seq_lengths_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=0,
+            softmax_lse_flag=True,
+        )
+        prefix_ms = (time.perf_counter() - prefix_start) * 1000.0
+        prefix_output = prefix_output.view(plan.num_rows, self.num_heads, self.head_size)
+        prefix_lse = prefix_lse.view(plan.num_rows, self.num_heads, 1)
+
+        current_output, current_lse, current_stats = run_split_current_tree_attention(
+            packed_query=packed_query,
+            current_key=current_key,
+            current_value=current_value,
+            plan=plan,
+            scale=self.scale,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+        )
+
+        merge_start = time.perf_counter()
+        merged_output = merge_split_tree_attention_outputs(
+            prefix_output=prefix_output,
+            prefix_lse=prefix_lse,
+            current_output=current_output,
+            current_lse=current_lse,
+        )
+        merge_ms = (time.perf_counter() - merge_start) * 1000.0
+
+        if os.getenv("VLLM_ASCEND_TREE_SPLIT_COMPARE_PATH"):
+            torch_lse = torch.stack([prefix_lse.to(torch.float32), current_lse.to(torch.float32)], dim=0)
+            torch_out = torch.stack([prefix_output.to(torch.float32), current_output.to(torch.float32)], dim=0)
+            torch_merged = torch.sum(
+                torch.exp(torch_lse - torch.logsumexp(torch_lse, dim=0, keepdim=True)) * torch_out,
+                dim=0,
+            ).to(merged_output.dtype)
+
+            gathered_key, gathered_value = self._gather_paged_kv_to_ragged(
+                attn_metadata.block_tables,
+                seq_lens,
+                query.dtype,
+                layer,
+            )
+            legacy_indices, legacy_output, _ = run_fast_tree_attention(
+                query=query,
+                key=gathered_key,
+                value=gathered_value,
+                seq_lens=seq_lens,
+                actual_seq_lengths_q=attn_metadata.actual_seq_lengths_q,
+                tree_mask=tree_mask,
+                scale=self.scale,
+                num_queries_per_kv=self.num_queries_per_kv,
+            )
+            legacy_trimmed = legacy_output[: plan.num_rows]
+            _maybe_dump_tree_split_compare(
+                {
+                    "layer_name": getattr(layer, "layer_name", None),
+                    "num_tokens": query.shape[0],
+                    "seq_lens_list": seq_lens,
+                    "actual_seq_lengths_q": attn_metadata.actual_seq_lengths_q,
+                    "output_indices_match": bool(torch.equal(legacy_indices, plan.output_indices)),
+                    "split_vs_legacy_max_diff": float((merged_output - legacy_trimmed).abs().max().item()),
+                    "split_vs_legacy_mean_diff": float((merged_output - legacy_trimmed).abs().mean().item()),
+                    "split_vs_torch_merge_max_diff": float((merged_output - torch_merged).abs().max().item()),
+                    "split_vs_torch_merge_mean_diff": float((merged_output - torch_merged).abs().mean().item()),
+                    "prefix_only_vs_legacy_max_diff": float((prefix_output - legacy_trimmed).abs().max().item()),
+                    "current_only_vs_legacy_max_diff": float((current_output - legacy_trimmed).abs().max().item()),
+                    "prefix_lse_min": float(prefix_lse.min().item()),
+                    "prefix_lse_max": float(prefix_lse.max().item()),
+                    "current_lse_min": float(current_lse.min().item()),
+                    "current_lse_max": float(current_lse.max().item()),
+                }
+            )
+
+        output[plan.output_indices] = merged_output[: plan.num_rows]
+        non_root_ms = prefix_ms + current_stats["total_ms"] + merge_ms
+        _maybe_dump_tree_fast_profile(
+            {
+                "layer_name": getattr(layer, "layer_name", None),
+                "num_tokens": query.shape[0],
+                "seq_lens_list": seq_lens,
+                "actual_seq_lengths_q": attn_metadata.actual_seq_lengths_q,
+                "row0_count": len(row0_token_indices),
+                "non_root_count": plan.num_rows,
+                "gather_ms": 0.0,
+                "row0_ms": row0_ms,
+                "non_root_ms": non_root_ms,
+                "total_ms": (time.perf_counter() - total_start) * 1000.0,
+                "tree_impl": "batched_split",
+                "non_root_stats": {
+                    **plan_stats,
+                    "pack_ms": current_stats["pack_ms"],
+                    "fia_ms": prefix_ms + current_stats["fia_ms"],
+                    "prefix_fia_ms": prefix_ms,
+                    "current_fia_ms": current_stats["fia_ms"],
+                    "merge_ms": merge_ms,
+                    "total_ms": non_root_ms,
+                },
+            }
+        )
+        return output
+
+    def forward_tree_fast_attention(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        tree_impl: str = "batched",
+    ) -> torch.Tensor:
+        total_start = time.perf_counter()
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        current_key = key[:num_tokens]
+        current_value = value[:num_tokens]
+        batch_size = len(attn_metadata.actual_seq_lengths_q)
+        seq_lens = attn_metadata.seq_lens_list[:batch_size]
+        tree_mask = attn_metadata.attn_mask
+        max_q_len = max(
+            q_end - (attn_metadata.actual_seq_lengths_q[idx - 1] if idx > 0 else 0)
+            for idx, q_end in enumerate(attn_metadata.actual_seq_lengths_q)
+        )
+        if tree_mask is None or tree_mask.shape[0] < max_q_len or tree_mask.shape[1] < max_q_len:
+            raise RuntimeError("tree fast attention requires a tree-specific attention mask")
+        tree_impl = resolve_tree_fast_impl(tree_impl)
+        if tree_impl == "batched":
+            return self._forward_tree_fast_attention_all_rows(
+                layer,
+                query,
+                current_key,
+                current_value,
+                attn_metadata,
+                output,
+                seq_lens,
+                tree_mask,
+                total_start,
+            )
+        if tree_impl == "batched_legacy":
+            return self._forward_tree_fast_attention_legacy(
+                layer,
+                query,
+                current_key,
+                current_value,
+                attn_metadata,
+                output,
+                seq_lens,
+                tree_mask,
+                total_start,
+            )
+        if tree_impl == "batched_split":
+            return self._forward_tree_fast_attention_split(
+                layer,
+                query,
+                current_key,
+                current_value,
+                attn_metadata,
+                output,
+                seq_lens,
+                tree_mask,
+                total_start,
+            )
+        raise ValueError(f"Unsupported tree fast attention impl '{tree_impl}'")
 
     def forward(
         self,
@@ -1375,10 +2425,41 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
+        use_tree_exact_attention = self._should_use_tree_exact_attention(attn_metadata)
+        if use_tree_exact_attention and attn_metadata.tree_fast_mixed_batch_fallback:
+            use_tree_exact_attention = False
+        tree_impl = resolve_tree_fast_impl(os.getenv("VLLM_ASCEND_TREE_FAST_IMPL", "batched")) if use_tree_exact_attention else None
+        if attn_metadata.tree_spec_decode_enabled:
+            _maybe_dump_tree_attn_trace(
+                layer_name=getattr(layer, "layer_name", None),
+                impl_name=type(self).__name__,
+                path="exact" if use_tree_exact_attention else "fallback",
+                attn_metadata=attn_metadata,
+                extra={
+                    "causal": attn_metadata.causal,
+                    "sliding_window": self.sliding_window,
+                    "has_sinks": self.sinks is not None,
+                    "enable_hamming_sparse": getattr(self, "enable_hamming_sparse", False),
+                    "attn_type": getattr(self.attn_type, "name", str(self.attn_type)),
+                    "selected_tree_impl": tree_impl,
+                },
+            )
+        if use_tree_exact_attention:
+            if tree_impl == "reference":
+                return self.forward_tree_exact_attention(layer, query, key, value, attn_metadata, output)
+            return self.forward_tree_fast_attention(
+                layer,
+                query,
+                key,
+                value,
+                attn_metadata,
+                output,
+                tree_impl=tree_impl,
+            )
         if output_padded is not None:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
+            attn_output = self.forward_impl(layer, query, key, value, kv_cache, attn_metadata, output_padded)
         else:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
+            attn_output = self.forward_impl(layer, query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1426,6 +2507,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+            if self._should_use_tree_exact_attention(attn_metadata):
+                return self.forward_tree_exact_attention(layer, query, attn_metadata, output)
             if attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
                 if _EXTRA_CTX.capturing:
                     attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output, layer)
@@ -1456,6 +2539,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                     attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
                     output[:num_tokens] = attn_output[:num_tokens]
                     return output
+                if self._should_use_tree_exact_attention(attn_metadata):
+                    return self.forward_tree_exact_attention(layer, query, attn_metadata, output)
                 if output_padded is not None:
                     attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
                 else:
@@ -1471,6 +2556,8 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                     attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
                     output[:num_tokens] = attn_output[:num_tokens]
                     return output
+                if self._should_use_tree_exact_attention(attn_metadata):
+                    return self.forward_tree_exact_attention(layer, query, attn_metadata, output)
                 if _EXTRA_CTX.capturing:
                     attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output, layer)
                     output[:num_tokens] = attn_output[:num_tokens]
@@ -1565,6 +2652,26 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         dense_k = dense_k.to(target_dtype) * layer._c8_k_scale
         dense_v = dense_v.to(target_dtype) * layer._c8_v_scale
         return dense_k, dense_v
+
+    def _gather_paged_kv_to_ragged(
+        self,
+        block_tables: torch.Tensor,
+        seq_lens: list[int],
+        target_dtype: torch.dtype,
+        layer: AttentionLayer | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if layer is None:
+            raise RuntimeError("C8 tree exact attention requires layer context for dequantization")
+        if self.key_cache is None or self.value_cache is None:
+            raise RuntimeError("tree exact attention requires initialized KV cache")
+        return self._dequant_paged_kv_to_dense(
+            self.key_cache,
+            self.value_cache,
+            block_tables[: len(seq_lens)],
+            seq_lens,
+            target_dtype,
+            layer,
+        )
 
     def _quantize_kv_to_int8(
         self,

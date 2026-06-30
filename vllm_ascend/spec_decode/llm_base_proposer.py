@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import inspect
+import json
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -53,6 +56,15 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.tree_execution import (
+    build_tree_attn_mask,
+    build_tree_execution_runtime_node_indices,
+    build_tree_target_attn_mask,
+    build_tree_query_position_offsets,
+    build_tree_query_slot_offsets,
+)
+from vllm_ascend.spec_decode.tree_first_pass import build_tree_first_pass_inputs
+from vllm_ascend.spec_decode.tree_runtime import build_spec_tree_runtime
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
 
 
@@ -127,8 +139,38 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return target_argmax
 
 
+_TREE_DRAFT_TRACE_COUNTER = 0
+
+
+def _maybe_dump_tree_draft_trace(payload: dict[str, Any]) -> None:
+    trace_path = os.getenv("VLLM_ASCEND_TREE_DRAFT_TRACE_PATH")
+    if not trace_path:
+        return
+
+    global _TREE_DRAFT_TRACE_COUNTER
+    max_steps = int(os.getenv("VLLM_ASCEND_TREE_DRAFT_TRACE_STEPS", "8"))
+    if _TREE_DRAFT_TRACE_COUNTER >= max_steps:
+        return
+
+    payload = dict(payload)
+    payload["step"] = _TREE_DRAFT_TRACE_COUNTER
+    payload["pid"] = os.getpid()
+    with open(trace_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    _TREE_DRAFT_TRACE_COUNTER += 1
+
+
+def _should_dump_tree_draft_detail() -> bool:
+    return os.getenv("VLLM_ASCEND_TREE_DRAFT_DETAIL_TRACE", "") not in ("", "0", "false", "False")
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
+
+    def _raise_if_speculative_token_tree_unimplemented(self):
+        # Ascend handles tree-mode validation after its local runner state
+        # (eager mode, proposer type, runtime layout) has been initialized.
+        return
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
         super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
@@ -192,6 +234,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.tp_group_context = nullcontext()
 
         self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+        self._init_speculative_token_tree_runtime()
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
@@ -238,6 +281,33 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.token_arange_np = np.arange(self.max_num_tokens + 1, dtype=np.int32)
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
+
+    def _get_upstream_parsed_speculative_token_tree(self):
+        config_type = type(self.speculative_config)
+        use_tree_method = inspect.getattr_static(config_type, "use_speculative_token_tree", None)
+        parsed_tree_attr = inspect.getattr_static(config_type, "parsed_speculative_token_tree", None)
+        if use_tree_method is None or parsed_tree_attr is None:
+            return None
+        if not self.speculative_config.use_speculative_token_tree():
+            return None
+        return self.speculative_config.parsed_speculative_token_tree
+
+    def _init_speculative_token_tree_runtime(self) -> None:
+        self.parsed_speculative_token_tree = self._get_upstream_parsed_speculative_token_tree()
+        self._tree_runtime = None
+        if self.parsed_speculative_token_tree is None:
+            return
+
+        if self.method not in ("eagle", "eagle3"):
+            raise NotImplementedError(
+                "speculative_token_tree on Ascend is currently limited to eager eagle/eagle3."
+            )
+        if self.use_cuda_graph:
+            raise NotImplementedError(
+                "speculative_token_tree on Ascend currently supports eager mode only."
+            )
+
+        self._tree_runtime = build_spec_tree_runtime(self.parsed_speculative_token_tree)
 
     def _get_model(self) -> nn.Module:
         """
@@ -694,6 +764,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
+        if self._tree_runtime is not None:
+            target_positions = self._get_positions(num_tokens)
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -828,7 +900,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
-
         if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
             attn_metadata.attn_mask = None
 
@@ -860,7 +931,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
 
         if self.pcp_size * self.dcp_size > 1:
-            if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
+            if self._tree_runtime is None and self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
                 # For pcp/dcp, tokens are split across different cp ranks,
                 # so we can not simply update slot_mapping by += 1.
                 # Instead, we pre-allocate mtp slot_mapping in model_runner
@@ -921,7 +992,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
             # Copy the old attn_metadata and update
-            if not self.parallel_drafting:
+            if self._tree_runtime is None and not self.parallel_drafting:
                 for draft_index in range(1, self.num_speculative_tokens):
                     per_layer_attn_metadata = dict()
                     for attn_group in self.draft_attn_groups:
@@ -959,24 +1030,36 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            model_inputs: dict[str, Any] = {
-                "num_input_tokens": num_input_tokens,
-                "batch_size": batch_size,
-                "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
-                "target_positions": target_positions,
-                "inputs_embeds": inputs_embeds,
-                "multi_steps_attn_metadata": multi_steps_attn_metadata,
-                "num_tokens": num_tokens,
-                "is_prefill": attn_metadata_i.num_prefills,
-            }
-            run_draft = partial(self._runnable, **model_inputs)
-
-            if self.enable_enpu:
-                self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
+            if self._tree_runtime is not None:
+                draft_token_ids = self._run_tree_draft(
+                    num_input_tokens=num_input_tokens,
+                    batch_size=batch_size,
+                    token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
+                    target_positions=target_positions,
+                    inputs_embeds=inputs_embeds,
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
+                    num_tokens=num_tokens,
+                    common_attn_metadata=common_attn_metadata,
+                )
             else:
-                draft_token_ids = run_draft()
-                self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+                model_inputs: dict[str, Any] = {
+                    "num_input_tokens": num_input_tokens,
+                    "batch_size": batch_size,
+                    "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
+                    "target_positions": target_positions,
+                    "inputs_embeds": inputs_embeds,
+                    "multi_steps_attn_metadata": multi_steps_attn_metadata,
+                    "num_tokens": num_tokens,
+                    "is_prefill": attn_metadata_i.num_prefills,
+                }
+                run_draft = partial(self._runnable, **model_inputs)
+
+                if self.enable_enpu:
+                    self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+                    draft_token_ids = run_draft()
+                else:
+                    draft_token_ids = run_draft()
+                    self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
@@ -993,6 +1076,353 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             logits = self.model.compute_logits(hidden_states)
             return greedy_sample(logits)
+
+    def _compute_tree_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if lmhead_tp_enable():
+            raise NotImplementedError("speculative_token_tree on Ascend does not support lmhead TP yet.")
+        return self.model.compute_logits(hidden_states)
+
+    def _expand_tree_level_positions(self, base_positions: torch.Tensor, level_size: int, depth: int) -> torch.Tensor:
+        if self.uses_mrope:
+            return (base_positions.unsqueeze(2) + depth).expand(-1, -1, level_size)
+        return (base_positions.unsqueeze(1) + depth).expand(-1, level_size)
+
+    def _patch_tree_attn_mask(self, attn_metadata, tree_depth: int):
+        assert self._tree_runtime is not None
+        tree_mask = build_tree_attn_mask(self._tree_runtime, tree_depth)
+        if attn_metadata.attn_mask is None:
+            attn_metadata.attn_mask = tree_mask.to(self.device)
+            return attn_metadata
+
+        patched_mask = attn_metadata.attn_mask.clone()
+        patched_mask[: tree_mask.shape[0], : tree_mask.shape[1]] = tree_mask.to(
+            device=patched_mask.device,
+            dtype=patched_mask.dtype,
+        )
+        attn_metadata.attn_mask = patched_mask
+        return attn_metadata
+
+    def _run_tree_draft(
+        self,
+        num_input_tokens,
+        batch_size,
+        token_indices_to_sample,
+        target_positions,
+        inputs_embeds,
+        multi_steps_attn_metadata,
+        num_tokens,
+        common_attn_metadata,
+    ) -> torch.Tensor:
+        assert self._tree_runtime is not None
+        runtime = self._tree_runtime
+
+        model_input_ids = self.input_ids[:num_input_tokens]
+        model_positions = self._get_positions(num_input_tokens)
+
+        model_kwargs = {
+            "input_ids": model_input_ids,
+            "positions": model_positions,
+            "inputs_embeds": inputs_embeds,
+        }
+        if self.pass_hidden_states_to_model:
+            model_hidden_states = self.hidden_states[:num_input_tokens]
+            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+            model_kwargs["hidden_states"] = model_hidden_states
+            if self.method == "mtp":
+                model_kwargs["positions"] = model_positions
+
+        ret_hidden_states = self.model(**model_kwargs)
+        if not self.model_returns_tuple():
+            last_hidden_states = ret_hidden_states
+            hidden_states = last_hidden_states
+        else:
+            last_hidden_states, hidden_states = ret_hidden_states
+
+        last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
+            last_hidden_states, model_positions, hidden_states
+        )
+
+        root_nodes = runtime.nodes_by_depth[0]
+        root_count = len(root_nodes)
+        result = torch.empty((batch_size, runtime.node_count), dtype=torch.int64, device=self.device)
+
+        root_last_hidden_states = last_hidden_states[token_indices_to_sample]
+        root_logits = self._compute_tree_logits(root_last_hidden_states)
+        regular_root_token_ids = None
+        if self.method in ("eagle3", "dflash"):
+            regular_root_token_ids = self.compute_draft_token_ids(root_last_hidden_states)
+        if root_count == 1:
+            root_token_ids = root_logits.argmax(dim=-1, keepdim=True)
+        else:
+            root_token_ids = torch.topk(root_logits, root_count, dim=-1).indices
+        _maybe_dump_tree_draft_trace(
+            {
+                "phase": "root",
+                "runtime_paths": [list(path) for path in runtime.paths],
+                "runtime_nodes_by_depth": [list(nodes) for nodes in runtime.nodes_by_depth],
+                "token_indices_to_sample": token_indices_to_sample.tolist(),
+                "model_input_ids": model_input_ids[:num_input_tokens].tolist(),
+                "target_positions": (
+                    target_positions[:, :num_input_tokens].tolist()
+                    if torch.is_tensor(target_positions) and target_positions.ndim > 1
+                    else target_positions[:num_input_tokens].tolist()
+                ),
+                "root_input_ids": self.input_ids[token_indices_to_sample].tolist(),
+                "root_hidden_token_feature": root_last_hidden_states[:, 0].tolist(),
+                "regular_root_token_ids": None
+                if regular_root_token_ids is None
+                else regular_root_token_ids.tolist(),
+                "tree_root_token_ids": root_token_ids.tolist(),
+                "tree_root_topk": torch.topk(root_logits, min(root_count, 4), dim=-1).indices.tolist(),
+            }
+        )
+        result[:, list(root_nodes)] = root_token_ids
+
+        if len(runtime.nodes_by_depth) == 1:
+            return result
+
+        if self.uses_mrope:
+            base_positions = target_positions[:, token_indices_to_sample]
+            slot_base_positions = base_positions[0].to(torch.int64)
+        else:
+            base_positions = target_positions[token_indices_to_sample]
+            slot_base_positions = base_positions.to(torch.int64)
+
+        current_level_nodes = root_nodes
+        level_tokens = root_token_ids.to(torch.int32)
+        parent_hidden_states = hidden_states[token_indices_to_sample].view(batch_size, 1, -1)
+        if root_count > 1:
+            parent_hidden_states = parent_hidden_states.repeat_interleave(root_count, dim=1)
+        level_positions = self._expand_tree_level_positions(base_positions, root_count, depth=1)
+
+        cumulative_input_ids = level_tokens
+        cumulative_hidden_states = parent_hidden_states
+        cumulative_positions = level_positions
+
+        base_seq_lens = common_attn_metadata.seq_lens[:batch_size].clone()
+        base_seq_lens_cpu = None
+        if common_attn_metadata.seq_lens_cpu is not None:
+            base_seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:batch_size].clone()
+        elif common_attn_metadata._seq_lens_cpu is not None:
+            base_seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:batch_size].clone()
+
+        slot_offsets_by_runtime = build_tree_query_slot_offsets(runtime)
+
+        for tree_depth, current_level_nodes in enumerate(runtime.nodes_by_depth[:-1], start=1):
+            total_num_drafts = cumulative_input_ids.shape[1]
+            num_tree_tokens = batch_size * total_num_drafts
+
+            forward_context = get_forward_context()
+            if forward_context is not None:
+                forward_context.moe_layer_index = 0
+
+            draft_common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+            draft_common_attn_metadata.num_reqs = batch_size
+            draft_common_attn_metadata.num_actual_tokens = num_tree_tokens
+            draft_common_attn_metadata.num_input_tokens = num_tree_tokens
+            draft_common_attn_metadata.max_query_len = total_num_drafts
+            draft_common_attn_metadata.decode_token_per_req = total_num_drafts
+            draft_common_attn_metadata.graph_pad_size = -1
+            draft_common_attn_metadata.seq_lens = base_seq_lens + total_num_drafts
+            if getattr(draft_common_attn_metadata, "seq_lens_cpu", None) is not None and base_seq_lens_cpu is not None:
+                draft_common_attn_metadata.seq_lens_cpu = base_seq_lens_cpu + total_num_drafts
+            if getattr(draft_common_attn_metadata, "_seq_lens_cpu", None) is not None and base_seq_lens_cpu is not None:
+                draft_common_attn_metadata._seq_lens_cpu = base_seq_lens_cpu + total_num_drafts
+            if getattr(draft_common_attn_metadata, "num_computed_tokens_cpu", None) is not None:
+                draft_common_attn_metadata.num_computed_tokens_cpu = (
+                    draft_common_attn_metadata.num_computed_tokens_cpu[:batch_size].clone() + total_num_drafts
+                )
+
+            exceeds_seq_len = draft_common_attn_metadata.seq_lens > self.max_model_len
+            draft_common_attn_metadata.seq_lens.masked_fill_(exceeds_seq_len, 1)
+            if getattr(draft_common_attn_metadata, "seq_lens_cpu", None) is not None:
+                draft_common_attn_metadata.seq_lens_cpu.masked_fill_(
+                    draft_common_attn_metadata.seq_lens_cpu > self.max_model_len,
+                    1,
+                )
+            if getattr(draft_common_attn_metadata, "_seq_lens_cpu", None) is not None:
+                draft_common_attn_metadata._seq_lens_cpu.masked_fill_(
+                    draft_common_attn_metadata._seq_lens_cpu > self.max_model_len,
+                    1,
+                )
+
+            draft_common_attn_metadata.query_start_loc = (
+                torch.arange(batch_size + 1, dtype=torch.int32, device=self.device) * total_num_drafts
+            )
+            draft_common_attn_metadata.query_start_loc_cpu = draft_common_attn_metadata.query_start_loc.cpu()
+            draft_common_attn_metadata.positions = (
+                cumulative_positions.reshape(cumulative_positions.shape[0], -1)
+                if self.uses_mrope
+                else cumulative_positions.reshape(-1)
+            )
+
+            execution_offsets = []
+            for runtime_nodes in runtime.nodes_by_depth[:tree_depth]:
+                execution_offsets.extend(slot_offsets_by_runtime[runtime_node_index] for runtime_node_index in runtime_nodes)
+            slot_query_positions = slot_base_positions.unsqueeze(1) + torch.tensor(
+                execution_offsets,
+                dtype=torch.int64,
+                device=self.device,
+            ).unsqueeze(0)
+            clamped_slot_query_positions = torch.where(
+                slot_query_positions >= self.max_model_len,
+                torch.zeros_like(slot_query_positions),
+                slot_query_positions,
+            )
+            block_size = (
+                self.kernel_block_size
+                if isinstance(self.kernel_block_size, int) and not getattr(self, "use_compress", False)
+                else 128
+            )
+            block_numbers = clamped_slot_query_positions // block_size
+            block_ids = common_attn_metadata.block_table_tensor[:batch_size].gather(dim=1, index=block_numbers)
+            slot_mapping = block_ids * block_size + clamped_slot_query_positions % block_size
+            slot_mapping.masked_fill_(slot_query_positions >= self.max_model_len, PADDING_SLOT_ID)
+            draft_common_attn_metadata.slot_mapping = slot_mapping.reshape(-1).to(torch.int32)
+            if getattr(draft_common_attn_metadata, "slot_mapping_cpu", None) is not None:
+                draft_common_attn_metadata.slot_mapping_cpu = draft_common_attn_metadata.slot_mapping.cpu()
+
+            per_layer_attn_metadata = dict()
+            for attn_group in self.draft_attn_groups:
+                attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                    draft_common_attn_metadata,
+                    tree_depth,
+                )
+                attn_metadata = self._patch_tree_attn_mask(attn_metadata, tree_depth)
+                for layer_name in self.attn_layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+
+            self.input_ids[:num_tree_tokens] = cumulative_input_ids.reshape(-1)
+            self._set_positions(num_tree_tokens, draft_common_attn_metadata.positions)
+            self.hidden_states[:num_tree_tokens] = cumulative_hidden_states.reshape(num_tree_tokens, -1)
+
+            if _should_dump_tree_draft_detail():
+                _maybe_dump_tree_draft_trace(
+                    {
+                        "phase": "level",
+                        "tree_depth": tree_depth,
+                        "runtime_paths": [list(path) for path in runtime.paths],
+                        "current_level_nodes": list(current_level_nodes),
+                        "execution_runtime_node_indices": list(
+                            build_tree_execution_runtime_node_indices(runtime)
+                        ),
+                        "cumulative_input_ids": cumulative_input_ids.tolist(),
+                        "draft_positions": (
+                            draft_common_attn_metadata.positions.tolist()
+                            if torch.is_tensor(draft_common_attn_metadata.positions)
+                            else None
+                        ),
+                        "slot_mapping": (
+                            draft_common_attn_metadata.slot_mapping.tolist()
+                            if getattr(draft_common_attn_metadata, "slot_mapping", None) is not None
+                            else None
+                        ),
+                    }
+                )
+
+            model_input_ids = self.input_ids[:num_tree_tokens]
+            model_positions = self._get_positions(num_tree_tokens)
+            model_hidden_states = self.hidden_states[:num_tree_tokens]
+            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+
+            if forward_context is not None:
+                forward_context.attn_metadata = per_layer_attn_metadata
+
+            model_kwargs = {
+                "input_ids": model_input_ids,
+                "positions": model_positions,
+                "inputs_embeds": None,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = model_hidden_states
+
+            ret_hidden_states = self.model(**model_kwargs)
+            if not self.model_returns_tuple():
+                level_last_hidden_states = ret_hidden_states
+                level_hidden_states = level_last_hidden_states
+            else:
+                level_last_hidden_states, level_hidden_states = ret_hidden_states
+
+            level_last_hidden_states, model_positions, level_hidden_states = self.maybe_all_gather_and_unpad(
+                level_last_hidden_states,
+                model_positions,
+                level_hidden_states,
+            )
+
+            current_level_count = len(current_level_nodes)
+            level_last_hidden_states = level_last_hidden_states[:num_tree_tokens].view(batch_size, total_num_drafts, -1)[
+                :, -current_level_count:
+            ]
+            level_hidden_states = level_hidden_states[:num_tree_tokens].view(batch_size, total_num_drafts, -1)[
+                :, -current_level_count:
+            ]
+
+            next_level_nodes = runtime.nodes_by_depth[tree_depth]
+            next_level_count = len(next_level_nodes)
+            next_level_logits = self._compute_tree_logits(level_last_hidden_states.reshape(batch_size * current_level_count, -1))
+            next_level_logits = next_level_logits.view(batch_size, current_level_count, -1)
+
+            next_level_tokens = torch.empty((batch_size, next_level_count), dtype=torch.int64, device=self.device)
+            next_level_hidden_states = torch.empty(
+                (batch_size, next_level_count, level_hidden_states.shape[-1]),
+                dtype=level_hidden_states.dtype,
+                device=self.device,
+            )
+            next_level_index = {runtime_node_index: idx for idx, runtime_node_index in enumerate(next_level_nodes)}
+
+            for parent_col, runtime_node_index in enumerate(current_level_nodes):
+                children = runtime.children[runtime_node_index]
+                child_count = len(children)
+                if child_count == 0:
+                    continue
+                parent_logits = next_level_logits[:, parent_col, :]
+                if child_count == 1:
+                    child_token_ids = parent_logits.argmax(dim=-1, keepdim=True)
+                else:
+                    child_token_ids = torch.topk(parent_logits, child_count, dim=-1).indices
+                for child_rank, child_runtime_node_index in enumerate(children):
+                    child_col = next_level_index[child_runtime_node_index]
+                    next_level_tokens[:, child_col] = child_token_ids[:, child_rank]
+                    next_level_hidden_states[:, child_col] = level_hidden_states[:, parent_col, :]
+
+            if _should_dump_tree_draft_detail():
+                _maybe_dump_tree_draft_trace(
+                    {
+                        "phase": "children",
+                        "tree_depth": tree_depth,
+                        "runtime_paths": [list(path) for path in runtime.paths],
+                        "current_level_nodes": list(current_level_nodes),
+                        "next_level_nodes": list(next_level_nodes),
+                        "next_level_tokens": next_level_tokens.tolist(),
+                    }
+                )
+
+            result[:, list(next_level_nodes)] = next_level_tokens
+
+            if tree_depth == len(runtime.nodes_by_depth) - 1:
+                break
+
+            level_tokens = next_level_tokens.to(torch.int32)
+            cumulative_input_ids = torch.cat((cumulative_input_ids, level_tokens), dim=1)
+            cumulative_hidden_states = torch.cat((cumulative_hidden_states, next_level_hidden_states), dim=1)
+            next_level_positions = self._expand_tree_level_positions(base_positions, next_level_count, depth=tree_depth + 1)
+            if self.uses_mrope:
+                cumulative_positions = torch.cat((cumulative_positions, next_level_positions), dim=2)
+            else:
+                cumulative_positions = torch.cat((cumulative_positions, next_level_positions), dim=1)
+
+        execution_runtime_node_indices = build_tree_execution_runtime_node_indices(runtime)
+        if _should_dump_tree_draft_detail():
+            _maybe_dump_tree_draft_trace(
+                {
+                    "phase": "result",
+                    "runtime_paths": [list(path) for path in runtime.paths],
+                    "execution_runtime_node_indices": list(execution_runtime_node_indices),
+                    "runtime_order_tokens": result.tolist(),
+                    "execution_order_tokens": result[:, list(execution_runtime_node_indices)].tolist(),
+                }
+            )
+        return result[:, list(execution_runtime_node_indices)]
 
     def _run_merged_draft(
         self,
@@ -1286,6 +1716,35 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_prefill_reqs=0,
         num_decode_reqs=0,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, tuple[Any, Any] | None]:
+        if self._tree_runtime is not None:
+            if token_indices_to_sample is None:
+                raise ValueError("Tree speculative decoding requires terminal row indices.")
+
+            tree_first_pass = build_tree_first_pass_inputs(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                terminal_row_indices=token_indices_to_sample,
+                common_attn_metadata=cad,
+            )
+
+            positions_to_set = tree_first_pass.positions
+            if getattr(self, "uses_xdrope_dim", 0) > 0 and getattr(self, "draft_uses_xdrope_dim", 0) == 0:
+                positions_to_set = positions_to_set[0]
+
+            num_tokens = tree_first_pass.num_tokens
+            self.input_ids[:num_tokens].copy_(tree_first_pass.token_ids)
+            self._set_positions(num_tokens, positions_to_set)
+            self.hidden_states[:num_tokens] = tree_first_pass.hidden_states.view(num_tokens, -1)
+
+            return (
+                num_tokens,
+                tree_first_pass.token_indices_to_sample,
+                tree_first_pass.common_attn_metadata,
+                None,
+            )
+
         if not self.needs_extra_input_slots:
             # Default EAGLE pathway: no reshaping of input tensors needed.
             # Simply rotate the input ids and leave the positions unchanged,
@@ -1668,7 +2127,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_index,
             **extra_attn_metadata_args,
         )
-
         if self.pcp_size * self.dcp_size > 1:
             kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
             if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
@@ -1910,6 +2368,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
             token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1 - num_rejected_tokens_gpu
+
+        if self._tree_runtime is not None and self.runner is not None:
+            terminal_row_indices = getattr(self.runner, "tree_terminal_row_indices", None)
+            if terminal_row_indices is not None:
+                token_indices_to_sample = terminal_row_indices.to(
+                    device=valid_sampled_tokens_count.device,
+                    dtype=torch.int32,
+                )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 

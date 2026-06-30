@@ -17,7 +17,11 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    get_effective_decode_threshold,
+    split_decodes_and_prefills,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
@@ -535,7 +539,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         if self.common_ratio_to_sas_metadata.get("num_decodes", None) is None:
             self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
-                split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=get_effective_decode_threshold(
+                        common_attn_metadata,
+                        self.decode_threshold,
+                    ),
+                )
             )
             self.common_ratio_to_sas_metadata["num_decodes"] = self.num_decodes
             self.common_ratio_to_sas_metadata["num_prefills"] = self.num_prefills
@@ -1141,7 +1151,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     ) -> AscendDSADecodeMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
-            common_attn_metadata, decode_threshold=self.decode_threshold
+            common_attn_metadata,
+            decode_threshold=get_effective_decode_threshold(
+                common_attn_metadata,
+                self.decode_threshold,
+            ),
         )
         num_input_tokens = common_attn_metadata.num_input_tokens
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()

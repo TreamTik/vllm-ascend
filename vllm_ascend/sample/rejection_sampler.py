@@ -31,6 +31,8 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+from vllm_ascend.spec_decode.tree_execution import AscendTreeSpecDecodeMetadata
+from vllm_ascend.spec_decode.tree_verifier import pack_tree_output_tokens, select_tree_accept_paths
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -174,6 +176,44 @@ class AscendRejectionSampler(RejectionSampler):
                 Contains the final output token IDs and their logprobs if
                 requested.
         """
+        if isinstance(metadata, AscendTreeSpecDecodeMetadata):
+            assert metadata.target_logits_indices is not None
+            assert metadata.draft_token_ids is not None
+            if not getattr(sampling_metadata, "all_greedy", False):
+                raise NotImplementedError(
+                    "speculative_token_tree on Ascend currently supports greedy sampling only."
+                )
+
+            target_logits = logits[metadata.target_logits_indices].to(torch.float32)
+            if not self.is_processed_logprobs_mode:
+                target_logits = target_logits.clone()
+            target_logits = self.apply_logits_processors(target_logits, sampling_metadata, metadata)
+            target_token_ids = target_logits.argmax(dim=-1)
+            accepted_paths = select_tree_accept_paths(
+                metadata=metadata,
+                draft_token_ids=metadata.draft_token_ids,
+                target_token_ids=target_token_ids,
+            )
+            terminal_row_indices = torch.tensor(
+                [path.terminal_row_index for path in accepted_paths],
+                dtype=torch.int32,
+                device=logits.device,
+            )
+            runner = getattr(self, "runner", None)
+            if runner is not None:
+                runner.tree_terminal_row_indices = terminal_row_indices
+                runner.tree_accepted_paths = accepted_paths
+            max_path_len = max((len(path.token_ids) for path in accepted_paths), default=0)
+            output_token_ids = pack_tree_output_tokens(
+                accepted_paths,
+                max_path_len=max_path_len,
+                device=logits.device,
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
+
         assert metadata.max_spec_len <= MAX_SPEC_LEN
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices

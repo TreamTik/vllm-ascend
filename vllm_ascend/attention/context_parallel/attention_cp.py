@@ -46,6 +46,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     filter_chunked_req_indices,
+    get_effective_decode_threshold,
     notify_kv_cache_written,
     split_decodes_and_prefills,
 )
@@ -117,7 +118,10 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = split_decodes_and_prefills(
             common_attn_metadata,
-            decode_threshold=self.decode_threshold,
+            decode_threshold=get_effective_decode_threshold(
+                common_attn_metadata,
+                self.decode_threshold,
+            ),
             treat_short_extends_as_decodes=False,
         )
         assert num_decodes + num_prefills == num_reqs

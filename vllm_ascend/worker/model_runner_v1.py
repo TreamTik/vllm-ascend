@@ -18,10 +18,13 @@
 #
 
 import gc
+import json
 import logging
 import math
+import os
 import sys
 import time
+import traceback
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -52,6 +55,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -90,7 +94,7 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSamp
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import copy_num_valid_draft_tokens
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
@@ -127,6 +131,7 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.attention.tree_attention import build_tree_paged_plan, resolve_tree_fast_impl
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -137,6 +142,12 @@ from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
+from vllm_ascend.spec_decode.tree_execution import (
+    build_tree_attn_mask,
+    build_tree_query_depth_offsets,
+    build_tree_spec_decode_metadata,
+    build_tree_target_attn_mask,
+)
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 from vllm_ascend.spec_decode.utils import (
     correct_optimistic_seq_lens_cpu,
@@ -193,6 +204,12 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+_TREE_TARGET_TRACE_ENV = "VLLM_ASCEND_TREE_TARGET_TRACE_PATH"
+_SAMPLE_TRACE_ENV = "VLLM_ASCEND_SAMPLE_TRACE_PATH"
+_SAMPLE_TRACE_LABEL_ENV = "VLLM_ASCEND_SAMPLE_TRACE_LABEL"
+_TREE_STATE_TRACE_ENV = "VLLM_ASCEND_TREE_STATE_TRACE_PATH"
+_TREE_ROW0_ISO_TRACE_ENV = "VLLM_ASCEND_TREE_ROW0_ISO_TRACE_PATH"
+_TREE_KV_MATERIALIZE_TRACE_ENV = "VLLM_ASCEND_TREE_KV_MATERIALIZE_TRACE_PATH"
 
 
 @dataclass
@@ -247,13 +264,58 @@ class ExecuteModelState(NamedTuple):
     sample_hidden_states: torch.Tensor
     aux_hidden_states: list[torch.Tensor] | None
     attn_metadata: "PerLayerAttnMetadata"
+    input_ids: torch.Tensor | None
     positions: torch.Tensor
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
 
 
+@dataclass(frozen=True)
+class TreeAcceptedPathSlotCopy:
+    request_index: int
+    runtime_node_index: int
+    token_id: int
+    position: int
+    source_row_index: int
+    source_slot: int
+    destination_slot: int
+
+
 class NPUModelRunner(GPUModelRunner):
+    def _prepare_tree_spec_decode_bootstrap_state(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        # Parent GPUModelRunner now creates the speculative drafter before
+        # Ascend-specific runner fields are initialized. Tree-mode Ascend
+        # drafters need a minimal runner surface at construction time.
+        if not hasattr(self, "pcp_size"):
+            self.pcp_size = 1
+        if not hasattr(self, "dcp_size"):
+            self.dcp_size = 1
+        if not hasattr(self, "pcp_rank"):
+            self.pcp_rank = 0
+        if not hasattr(self, "dcp_rank"):
+            self.dcp_rank = 0
+        if not hasattr(self, "use_eagle"):
+            self.use_eagle = (
+                vllm_config.speculative_config.use_eagle()
+                if vllm_config.speculative_config
+                else None
+            )
+        if not hasattr(self, "enable_enpu"):
+            _enpu = get_c_env("ENPU_ENABLE")
+            self.enable_enpu = _enpu is not None and _enpu.lower() == "true"
+        if not hasattr(self, "query_start_loc"):
+            self.query_start_loc = CpuGpuBuffer(
+                vllm_config.scheduler_config.max_num_seqs + 2,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=is_pin_memory_available(),
+            )
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
@@ -271,6 +333,7 @@ class NPUModelRunner(GPUModelRunner):
         self.use_compress = (
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
+        self._prepare_tree_spec_decode_bootstrap_state(vllm_config, device)
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
@@ -624,8 +687,11 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
                     self.use_aux_hidden_state_outputs = True
                 self.rejection_sampler = AscendRejectionSampler(self.sampler)
+                self.rejection_sampler.runner = self
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
+        self.tree_terminal_row_indices = None
+        self.tree_accepted_paths = None
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1098,6 +1164,14 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+        self._maybe_dump_tree_state_trace(
+            phase="prepare_inputs_after_num_computed_update",
+            valid_sampled_tokens_count=self.valid_sampled_token_count_gpu[:num_reqs]
+            if self.valid_sampled_token_count_gpu is not None
+            else None,
+            num_computed_tokens=self.num_computed_tokens[:num_reqs],
+            num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs],
+        )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -1236,6 +1310,14 @@ class NPUModelRunner(GPUModelRunner):
 
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
             self._correct_optimistic_seq_lens_cpu(num_reqs)
+            self._maybe_dump_tree_state_trace(
+                phase="prepare_inputs_after_seq_lens_correction",
+                valid_sampled_tokens_count=self.valid_sampled_token_count_gpu[:num_reqs]
+                if self.valid_sampled_token_count_gpu is not None
+                else None,
+                num_computed_tokens=self.num_computed_tokens[:num_reqs],
+                num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs],
+            )
 
         num_computed_tokens_for_compress = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs]
@@ -1313,11 +1395,14 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     num_decode_draft_tokens[req_idx] = -1
 
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens,
-                cu_num_tokens,
-                num_pcp_pads=self.pcp_manager.num_pcp_pads_cpu[:num_reqs] if self.pcp_size > 1 else None,
-            )
+            if getattr(self.drafter, "_tree_runtime", None) is not None:
+                spec_decode_metadata = self._calc_tree_spec_decode_metadata(batch_size=num_reqs)
+            else:
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_tokens,
+                    cu_num_tokens,
+                    num_pcp_pads=self.pcp_manager.num_pcp_pads_cpu[:num_reqs] if self.pcp_size > 1 else None,
+                )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
@@ -1632,6 +1717,883 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices=logits_indices,
         )
 
+    def _calc_tree_spec_decode_metadata(self, batch_size: int):
+        assert self.drafter is not None
+        assert getattr(self.drafter, "_tree_runtime", None) is not None
+
+        runtime = self.drafter._tree_runtime
+        metadata = build_tree_spec_decode_metadata(runtime, batch_size)
+        total_tree_nodes = batch_size * runtime.node_count
+        rows_per_request = runtime.node_count + 1
+        total_tree_rows = batch_size * rows_per_request
+        num_draft_tokens = [runtime.node_count] * batch_size
+        cu_num_draft_tokens = torch.arange(
+            runtime.node_count,
+            total_tree_nodes + 1,
+            runtime.node_count,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        target_logits_indices = torch.arange(total_tree_rows, dtype=torch.int32, device=self.device)
+        bonus_logits_indices_list = []
+        draft_token_input_indices = []
+        for request_index in range(batch_size):
+            request_row_offset = metadata.request_row_offsets[request_index]
+            bonus_logits_indices_list.append(request_row_offset)
+            for execution_index in range(runtime.node_count):
+                draft_token_input_indices.append(request_row_offset + execution_index + 1)
+
+        logits_indices = target_logits_indices
+        bonus_logits_indices = torch.tensor(
+            bonus_logits_indices_list, dtype=torch.int32, device=self.device
+        )
+        execution_draft_token_ids = self.input_ids.gpu[
+            torch.tensor(draft_token_input_indices, dtype=torch.int64, device=self.device)
+        ]
+        draft_token_ids = torch.empty_like(execution_draft_token_ids)
+        for request_index in range(batch_size):
+            request_node_offset = metadata.request_node_offsets[request_index]
+            for runtime_node_index in range(runtime.node_count):
+                execution_index = metadata.runtime_node_to_execution_index[runtime_node_index]
+                draft_token_ids[request_node_offset + runtime_node_index] = execution_draft_token_ids[
+                    request_node_offset + execution_index
+                ]
+
+        return replace(
+            metadata,
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens,
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
+        )
+
+    def _maybe_dump_tree_target_trace(
+        self,
+        *,
+        phase: str,
+        spec_decode_metadata,
+        positions: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        common_attn_metadata: Any | None = None,
+        attn_metadata: Any | None = None,
+        linear_positions: torch.Tensor | None = None,
+        advance_round: bool = False,
+    ) -> None:
+        trace_path = os.getenv(_TREE_TARGET_TRACE_ENV)
+        if not trace_path or not hasattr(spec_decode_metadata, "runtime"):
+            return
+
+        round_index = getattr(self, "_tree_target_trace_round", 0)
+        max_steps = int(os.getenv("VLLM_ASCEND_TREE_TARGET_TRACE_STEPS", "16"))
+        if round_index >= max_steps:
+            return
+
+        runtime = spec_decode_metadata.runtime
+        rows_per_request = runtime.node_count + 1
+        total_rows = spec_decode_metadata.batch_size * rows_per_request
+        execution_runtime_node_indices = list(spec_decode_metadata.execution_runtime_node_indices)
+        row_labels = ["bonus"] + [
+            list(runtime.paths[runtime_node_index])
+            for runtime_node_index in execution_runtime_node_indices
+        ]
+
+        def _serialize(value: Any, row_limit: int | None = None) -> Any:
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                tensor = value.detach().cpu()
+                if row_limit is not None and tensor.ndim > 0 and tensor.shape[0] > row_limit:
+                    tensor = tensor[:row_limit]
+                return tensor.tolist()
+            if hasattr(value, "tolist"):
+                try:
+                    return value.tolist()
+                except TypeError:
+                    return value
+            return value
+
+        def _slice_rows(value: Any | None) -> Any:
+            if value is None or not torch.is_tensor(value):
+                return _serialize(value)
+            if value.ndim == 0:
+                return value.item()
+            if value.ndim == 1:
+                return _serialize(value[:total_rows])
+            if value.ndim >= 2:
+                return _serialize(value[..., :total_rows])
+            return _serialize(value)
+
+        def _get_first_metadata_item(value: Any | None) -> Any | None:
+            if value is None:
+                return None
+            if isinstance(value, list):
+                for ubatch_metadata in value:
+                    if isinstance(ubatch_metadata, dict) and ubatch_metadata:
+                        return next(iter(ubatch_metadata.values()))
+                return None
+            if isinstance(value, dict) and value:
+                return next(iter(value.values()))
+            return value
+
+        first_metadata_item = _get_first_metadata_item(attn_metadata)
+        request_rows = []
+        flat_input_ids = _slice_rows(input_ids if input_ids is not None else self.input_ids.gpu)
+        flat_positions = _slice_rows(positions)
+        flat_linear_positions = _slice_rows(linear_positions)
+        flat_slot_mapping = _serialize(
+            getattr(common_attn_metadata, "slot_mapping", None),
+            row_limit=total_rows,
+        )
+
+        if isinstance(flat_input_ids, list) and isinstance(flat_positions, list):
+            for request_index in range(spec_decode_metadata.batch_size):
+                row_offset = request_index * rows_per_request
+                row_end = row_offset + rows_per_request
+                request_rows.append(
+                    {
+                        "request_index": request_index,
+                        "row_labels": row_labels,
+                        "input_ids": flat_input_ids[row_offset:row_end],
+                        "positions": flat_positions[row_offset:row_end],
+                        "linear_positions": (
+                            flat_linear_positions[row_offset:row_end]
+                            if isinstance(flat_linear_positions, list)
+                            else flat_linear_positions
+                        ),
+                        "slot_mapping": (
+                            flat_slot_mapping[row_offset:row_end]
+                            if isinstance(flat_slot_mapping, list)
+                            else flat_slot_mapping
+                        ),
+                    }
+                )
+
+        payload = {
+            "step": round_index,
+            "phase": phase,
+            "pid": os.getpid(),
+            "common_tree_spec_decode_enabled": getattr(common_attn_metadata, "tree_spec_decode_enabled", None),
+            "runtime_paths": [list(path) for path in runtime.paths],
+            "runtime_parent_index": list(runtime.parent_index),
+            "runtime_depth": list(runtime.depth),
+            "execution_runtime_node_indices": execution_runtime_node_indices,
+            "runtime_node_to_execution_index": list(spec_decode_metadata.runtime_node_to_execution_index),
+            "request_row_offsets": list(spec_decode_metadata.request_row_offsets),
+            "target_logits_indices": _serialize(getattr(spec_decode_metadata, "target_logits_indices", None)),
+            "bonus_logits_indices": _serialize(getattr(spec_decode_metadata, "bonus_logits_indices", None)),
+            "request_rows": request_rows,
+            "query_start_loc": _serialize(getattr(common_attn_metadata, "query_start_loc", None)),
+            "query_start_loc_cpu": _serialize(getattr(common_attn_metadata, "query_start_loc_cpu", None)),
+            "seq_lens": _serialize(getattr(common_attn_metadata, "seq_lens", None)),
+            "seq_lens_cpu": _serialize(getattr(common_attn_metadata, "seq_lens_cpu", None)),
+            "common_positions": _slice_rows(getattr(common_attn_metadata, "positions", None)),
+            "common_slot_mapping": flat_slot_mapping,
+            "attn_mask": _serialize(
+                getattr(first_metadata_item, "attn_mask", None),
+                row_limit=rows_per_request,
+            ),
+            "metadata_positions": _slice_rows(getattr(first_metadata_item, "positions", None)),
+            "metadata_slot_mapping": _serialize(
+                getattr(first_metadata_item, "slot_mapping", None),
+                row_limit=total_rows,
+            ),
+            "metadata_seq_lens": _serialize(getattr(first_metadata_item, "seq_lens", None)),
+            "metadata_query_start_loc": _serialize(getattr(first_metadata_item, "query_start_loc", None)),
+            "metadata_num_decodes": getattr(first_metadata_item, "num_decodes", None),
+            "metadata_num_prefills": getattr(first_metadata_item, "num_prefills", None),
+            "metadata_num_decode_tokens": getattr(first_metadata_item, "num_decode_tokens", None),
+            "metadata_num_actual_tokens": getattr(first_metadata_item, "num_actual_tokens", None),
+            "metadata_attn_state": getattr(getattr(first_metadata_item, "attn_state", None), "name", None),
+        }
+        with open(trace_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        if advance_round:
+            self._tree_target_trace_round = round_index + 1
+
+    def _maybe_dump_sample_trace(
+        self,
+        *,
+        logits: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        sampler_output: SamplerOutput,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        trace_path = os.getenv(_SAMPLE_TRACE_ENV)
+        if not trace_path:
+            return
+
+        round_index = getattr(self, "_sample_trace_round", 0)
+        max_steps = int(os.getenv("VLLM_ASCEND_SAMPLE_TRACE_STEPS", "32"))
+        if round_index >= max_steps:
+            return
+
+        topk = max(1, int(os.getenv("VLLM_ASCEND_SAMPLE_TRACE_TOPK", "8")))
+        head_dim = max(1, int(os.getenv("VLLM_ASCEND_SAMPLE_TRACE_HIDDEN_HEAD", "8")))
+        max_reqs = max(1, int(os.getenv("VLLM_ASCEND_SAMPLE_TRACE_MAX_REQS", "2")))
+        sampled_token_ids = sampler_output.sampled_token_ids.detach().cpu().tolist()
+
+        def _serialize_output_prefixes() -> list[dict[str, Any]]:
+            output_token_ids = getattr(self.input_batch.sampling_metadata, "output_token_ids", None) or []
+            prefixes: list[dict[str, Any]] = []
+            for request_index, tokens in enumerate(output_token_ids[:max_reqs]):
+                tail = list(tokens[-16:]) if tokens else []
+                prefixes.append(
+                    {
+                        "request_index": request_index,
+                        "req_id": (
+                            self.input_batch.req_ids[request_index]
+                            if request_index < len(self.input_batch.req_ids)
+                            else None
+                        ),
+                        "prefix_len": len(tokens),
+                        "prefix_tail": tail,
+                    }
+                )
+            return prefixes
+
+        def _summarize_hidden_row(row_index: int) -> dict[str, Any]:
+            hidden_row = sample_hidden_states[row_index].detach().to(torch.float32).cpu()
+            head = hidden_row[:head_dim].tolist()
+            return {
+                "row_index": row_index,
+                "hidden_norm": float(hidden_row.norm().item()),
+                "hidden_max_abs": float(hidden_row.abs().max().item()),
+                "hidden_head": head,
+            }
+
+        def _summarize_logits_row(row_index: int) -> dict[str, Any]:
+            row_logits = logits[row_index].detach().to(torch.float32)
+            k = min(topk, row_logits.shape[-1])
+            top_vals, top_ids = torch.topk(row_logits, k=k, dim=-1)
+            return {
+                "row_index": row_index,
+                "top_token_ids": top_ids.cpu().tolist(),
+                "top_logits": top_vals.cpu().tolist(),
+            }
+
+        request_infos: list[dict[str, Any]] = []
+        if spec_decode_metadata is not None and hasattr(spec_decode_metadata, "runtime"):
+            runtime = spec_decode_metadata.runtime
+            rows_per_request = runtime.node_count + 1
+            row_labels = ["bonus"] + [
+                list(runtime.paths[runtime_node_index])
+                for runtime_node_index in spec_decode_metadata.execution_runtime_node_indices
+            ]
+            target_logits_indices = spec_decode_metadata.target_logits_indices
+            assert target_logits_indices is not None
+            target_logits_indices_cpu = target_logits_indices.detach().cpu().tolist()
+
+            for request_index in range(min(spec_decode_metadata.batch_size, max_reqs)):
+                row_offset = request_index * rows_per_request
+                row_infos = []
+                for local_row_index in range(rows_per_request):
+                    logits_row_index = target_logits_indices_cpu[row_offset + local_row_index]
+                    row_info = {
+                        "local_row_index": local_row_index,
+                        "row_label": row_labels[local_row_index],
+                    }
+                    row_info.update(_summarize_hidden_row(logits_row_index))
+                    row_info.update(_summarize_logits_row(logits_row_index))
+                    row_infos.append(row_info)
+                request_infos.append(
+                    {
+                        "request_index": request_index,
+                        "target_rows": row_infos,
+                    }
+                )
+        else:
+            row_count = min(logits.shape[0], max_reqs)
+            row_infos = []
+            for row_index in range(row_count):
+                row_info = {
+                    "local_row_index": row_index,
+                    "row_label": "sample",
+                }
+                row_info.update(_summarize_hidden_row(row_index))
+                row_info.update(_summarize_logits_row(row_index))
+                row_infos.append(row_info)
+            request_infos.append(
+                {
+                    "request_index": 0,
+                    "target_rows": row_infos,
+                }
+            )
+
+        payload = {
+            "step": round_index,
+            "pid": os.getpid(),
+            "label": os.getenv(_SAMPLE_TRACE_LABEL_ENV),
+            "has_tree_runtime": bool(spec_decode_metadata is not None and hasattr(spec_decode_metadata, "runtime")),
+            "lmhead_tp_enabled": lmhead_tp_enable(),
+            "enable_reduce_sample": get_ascend_config().enable_reduce_sample,
+            "sampled_token_ids": sampled_token_ids,
+            "tree_terminal_row_indices": (
+                self.tree_terminal_row_indices.detach().cpu().tolist()
+                if isinstance(self.tree_terminal_row_indices, torch.Tensor)
+                else None
+            ),
+            "output_prefixes": _serialize_output_prefixes(),
+            "request_infos": request_infos,
+        }
+        with open(trace_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._sample_trace_round = round_index + 1
+
+    def _maybe_dump_tree_row0_isolated_trace(
+        self,
+        *,
+        logits: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        attn_metadata: "PerLayerAttnMetadata",
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> None:
+        trace_path = os.getenv(_TREE_ROW0_ISO_TRACE_ENV)
+        if (
+            not trace_path
+            or spec_decode_metadata is None
+            or not hasattr(spec_decode_metadata, "runtime")
+            or input_ids is None
+            or isinstance(attn_metadata, list)
+        ):
+            return
+        tp_rank = get_tp_group().rank_in_group
+
+        round_index = getattr(self, "_tree_row0_iso_trace_round", 0)
+        max_steps = int(os.getenv("VLLM_ASCEND_TREE_ROW0_ISO_TRACE_STEPS", "16"))
+        if round_index >= max_steps:
+            return
+
+        first_metadata_item = next(iter(attn_metadata.values()), None)
+        if first_metadata_item is None:
+            return
+
+        request_index = 0
+        q_end = int(first_metadata_item.actual_seq_lengths_q[request_index])
+        q_start = 0
+        q_len = q_end - q_start
+        root_seq_len = int(first_metadata_item.seq_lens_list[request_index]) - q_len + 1
+
+        seq_lens = torch.tensor(
+            [root_seq_len],
+            dtype=first_metadata_item.seq_lens.dtype,
+            device=first_metadata_item.seq_lens.device,
+        )
+        seq_lens_cpu = None
+        if first_metadata_item.seq_lens_cpu is not None:
+            seq_lens_cpu = torch.tensor(
+                [root_seq_len],
+                dtype=first_metadata_item.seq_lens_cpu.dtype,
+                device=first_metadata_item.seq_lens_cpu.device,
+            )
+        query_start_loc = None
+        if first_metadata_item.query_start_loc is not None:
+            query_start_loc = torch.tensor(
+                [0, 1],
+                dtype=first_metadata_item.query_start_loc.dtype,
+                device=first_metadata_item.query_start_loc.device,
+            )
+
+        row0_attn_mask = torch.zeros(
+            (1, 1),
+            dtype=(
+                first_metadata_item.attn_mask.dtype
+                if first_metadata_item.attn_mask is not None
+                else torch.int8
+            ),
+            device=positions.device,
+        )
+        isolated_attn_metadata = {
+            layer_name: replace(
+                metadata_item,
+                attn_mask=row0_attn_mask,
+                attn_state=AscendAttentionState.ChunkedPrefill,
+                num_actual_tokens_pcp_padded=1,
+                num_actual_tokens=1,
+                num_decode_tokens=0,
+                num_prefills=1,
+                num_decodes=0,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_list=[root_seq_len],
+                actual_seq_lengths_q=[1],
+                query_start_loc=query_start_loc,
+                max_query_len=1,
+                block_tables=metadata_item.block_tables[request_index : request_index + 1],
+                slot_mapping=metadata_item.slot_mapping[0:1],
+                prefill=None,
+                decode_meta=None,
+                tree_spec_decode_enabled=True,
+            )
+            for layer_name, metadata_item in attn_metadata.items()
+        }
+
+        row0_input_ids = input_ids[0:1]
+        row0_positions = positions[0:1]
+
+        payload = {
+            "step": round_index,
+            "pid": os.getpid(),
+            "tp_rank": tp_rank,
+            "row0_input_ids": row0_input_ids.detach().cpu().tolist(),
+            "row0_positions": row0_positions.detach().cpu().tolist(),
+            "root_seq_len": root_seq_len,
+            "mode": "ok",
+        }
+        try:
+            update_cos_sin(row0_positions)
+            with set_ascend_forward_context(
+                isolated_attn_metadata,
+                self.vllm_config,
+                num_tokens=1,
+                num_actual_tokens=1,
+                batch_descriptor=None,
+                model_instance=self.model,
+                has_sinks=self._has_sinks,
+                input_ids=row0_input_ids,
+                positions=row0_positions,
+            ):
+                isolated_hidden_states = self._model_forward(1, row0_input_ids, row0_positions, None, None)
+
+            if isinstance(isolated_hidden_states, tuple):
+                isolated_hidden_states = isolated_hidden_states[0]
+
+            isolated_sample_hidden = isolated_hidden_states[0].detach().to(torch.float32)
+            batched_sample_hidden = sample_hidden_states[0].detach().to(torch.float32)
+            isolated_logits = self.model.compute_logits(isolated_hidden_states[:1])[0].detach().to(torch.float32)
+            batched_logits = logits[0].detach().to(torch.float32)
+
+            topk = max(1, int(os.getenv("VLLM_ASCEND_TREE_ROW0_ISO_TRACE_TOPK", "8")))
+            iso_top_vals, iso_top_ids = torch.topk(isolated_logits, k=min(topk, isolated_logits.shape[-1]), dim=-1)
+            batched_top_vals, batched_top_ids = torch.topk(
+                batched_logits,
+                k=min(topk, batched_logits.shape[-1]),
+                dim=-1,
+            )
+
+            payload.update(
+                {
+                    "hidden_max_abs_diff": float((batched_sample_hidden - isolated_sample_hidden).abs().max().item()),
+                    "hidden_mean_abs_diff": float((batched_sample_hidden - isolated_sample_hidden).abs().mean().item()),
+                    "logits_max_abs_diff": float((batched_logits - isolated_logits).abs().max().item()),
+                    "logits_mean_abs_diff": float((batched_logits - isolated_logits).abs().mean().item()),
+                    "batched_top_token_ids": batched_top_ids.cpu().tolist(),
+                    "batched_top_logits": batched_top_vals.cpu().tolist(),
+                    "isolated_top_token_ids": iso_top_ids.cpu().tolist(),
+                    "isolated_top_logits": iso_top_vals.cpu().tolist(),
+                }
+            )
+        except Exception as exc:
+            payload.update(
+                {
+                    "mode": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        if tp_rank == 0:
+            with open(trace_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._tree_row0_iso_trace_round = round_index + 1
+
+    def _maybe_dump_tree_state_trace(
+        self,
+        *,
+        phase: str,
+        sampled_token_ids: torch.Tensor | None = None,
+        next_token_ids: torch.Tensor | None = None,
+        valid_sampled_tokens_count: torch.Tensor | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+    ) -> None:
+        trace_path = os.getenv(_TREE_STATE_TRACE_ENV)
+        if not trace_path or getattr(self.drafter, "_tree_runtime", None) is None:
+            return
+
+        round_index = getattr(self, "_tree_state_trace_round", 0)
+        max_steps = int(os.getenv("VLLM_ASCEND_TREE_STATE_TRACE_STEPS", "32"))
+        if round_index >= max_steps:
+            return
+
+        max_reqs = max(1, int(os.getenv("VLLM_ASCEND_TREE_STATE_TRACE_MAX_REQS", "2")))
+        tail_len = max(1, int(os.getenv("VLLM_ASCEND_TREE_STATE_TRACE_TAIL", "16")))
+
+        def _serialize(value: Any, row_limit: int | None = None) -> Any:
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                tensor = value.detach().cpu()
+                if row_limit is not None and tensor.ndim > 0 and tensor.shape[0] > row_limit:
+                    tensor = tensor[:row_limit]
+                return tensor.tolist()
+            if hasattr(value, "tolist"):
+                try:
+                    return value.tolist()
+                except TypeError:
+                    return value
+            return value
+
+        def _tail_prefix(prefix: list[int] | None, limit: int) -> list[int]:
+            if not prefix:
+                return []
+            return list(prefix[-limit:])
+
+        req_rows = []
+        num_reqs = min(self.input_batch.num_reqs, max_reqs)
+        for request_index in range(num_reqs):
+            req_id = self.input_batch.req_ids[request_index]
+            num_computed_cpu = int(self.input_batch.num_computed_tokens_cpu[request_index])
+            num_tokens_no_spec = int(self.input_batch.num_tokens_no_spec[request_index])
+            computed_tail_start = max(0, num_computed_cpu - tail_len)
+            no_spec_tail_start = max(0, num_tokens_no_spec - tail_len)
+            token_ids_cpu = self.input_batch.token_ids_cpu[request_index]
+            req_state = self.requests.get(req_id)
+            req_rows.append(
+                {
+                    "request_index": request_index,
+                    "req_id": req_id,
+                    "num_prompt_tokens": int(self.input_batch.num_prompt_tokens[request_index]),
+                    "num_computed_tokens_cpu": num_computed_cpu,
+                    "num_tokens_no_spec": num_tokens_no_spec,
+                    "spec_token_ids": list(self.input_batch.spec_token_ids[request_index]),
+                    "token_ids_cpu_computed_tail": token_ids_cpu[computed_tail_start:num_computed_cpu].tolist(),
+                    "token_ids_cpu_no_spec_tail": token_ids_cpu[no_spec_tail_start:num_tokens_no_spec].tolist(),
+                    "request_output_tail": _tail_prefix(
+                        getattr(req_state, "output_token_ids", None) if req_state is not None else None,
+                        tail_len,
+                    ),
+                    "sampling_output_tail": _tail_prefix(
+                        self.input_batch.sampling_metadata.output_token_ids[request_index]
+                        if request_index < len(self.input_batch.sampling_metadata.output_token_ids)
+                        else None,
+                        tail_len,
+                    ),
+                }
+            )
+
+        payload = {
+            "step": round_index,
+            "phase": phase,
+            "pid": os.getpid(),
+            "use_async_scheduling": self.use_async_scheduling,
+            "use_async_spec_decode": self.use_async_spec_decode,
+            "num_spec_tokens": self.num_spec_tokens,
+            "req_ids": list(self.input_batch.req_ids[:num_reqs]),
+            "prev_req_id_to_index": dict(self.input_batch.prev_req_id_to_index or {}),
+            "tree_terminal_row_indices": (
+                getattr(self, "tree_terminal_row_indices").detach().cpu().tolist()
+                if isinstance(getattr(self, "tree_terminal_row_indices", None), torch.Tensor)
+                else None
+            ),
+            "sampled_token_ids": _serialize(sampled_token_ids, row_limit=max_reqs),
+            "next_token_ids": _serialize(next_token_ids, row_limit=max_reqs),
+            "valid_sampled_tokens_count": _serialize(valid_sampled_tokens_count, row_limit=max_reqs),
+            "valid_sampled_token_count_cpu": (
+                self.valid_sampled_token_count_cpu[:num_reqs].tolist()
+                if self.valid_sampled_token_count_cpu is not None
+                else None
+            ),
+            "prev_sampled_token_ids": _serialize(getattr(self.input_batch, "prev_sampled_token_ids", None), row_limit=max_reqs),
+            "num_accepted_tokens": _serialize(num_accepted_tokens, row_limit=max_reqs),
+            "input_batch_num_accepted_tokens_cpu": self.input_batch.num_accepted_tokens_cpu[:num_reqs].tolist(),
+            "num_computed_tokens": _serialize(num_computed_tokens, row_limit=max_reqs),
+            "input_batch_num_computed_tokens_cpu": self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+            "optimistic_seq_lens_cpu": self.optimistic_seq_lens_cpu[:num_reqs].tolist(),
+            "prev_positions": self.prev_positions.np[:num_reqs].tolist(),
+            "prev_num_draft_tokens": self.prev_num_draft_tokens.np[:num_reqs].tolist(),
+            "request_rows": req_rows,
+        }
+        with open(trace_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._tree_state_trace_round = round_index + 1
+
+    def _plan_tree_accepted_path_slot_copies(
+        self,
+        spec_decode_metadata,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> list[TreeAcceptedPathSlotCopy]:
+        accepted_paths = getattr(self, "tree_accepted_paths", None)
+        if (
+            accepted_paths is None
+            or not hasattr(spec_decode_metadata, "runtime")
+            or getattr(common_attn_metadata, "slot_mapping", None) is None
+            or getattr(common_attn_metadata, "positions", None) is None
+            or getattr(common_attn_metadata, "block_table_tensor", None) is None
+        ):
+            return []
+
+        block_table = common_attn_metadata.block_table_tensor
+        if block_table.ndim != 2:
+            return []
+
+        slot_mapping = common_attn_metadata.slot_mapping
+        positions = common_attn_metadata.positions
+        if positions.ndim > 1:
+            positions = positions[0]
+        block_size = self.input_batch.block_table[0].block_size
+
+        copies: list[TreeAcceptedPathSlotCopy] = []
+        for request_index, accepted_path in enumerate(accepted_paths):
+            request_row_offset = spec_decode_metadata.request_row_offsets[request_index]
+            for runtime_node_index, token_id in zip(accepted_path.node_indices, accepted_path.token_ids):
+                execution_index = spec_decode_metadata.runtime_node_to_execution_index[runtime_node_index]
+                source_row_index = request_row_offset + execution_index + 1
+                source_slot = int(slot_mapping[source_row_index].item())
+                if source_slot < 0:
+                    continue
+
+                position = int(positions[source_row_index].item())
+                block_index = position // block_size
+                if block_index >= block_table.shape[1]:
+                    continue
+                block_number = int(block_table[request_index, block_index].item())
+                if block_number < 0:
+                    continue
+                block_offset = position % block_size
+                destination_slot = block_number * block_size + block_offset
+                if destination_slot < 0 or destination_slot == source_slot:
+                    continue
+
+                copies.append(
+                    TreeAcceptedPathSlotCopy(
+                        request_index=request_index,
+                        runtime_node_index=int(runtime_node_index),
+                        token_id=int(token_id),
+                        position=position,
+                        source_row_index=source_row_index,
+                        source_slot=source_slot,
+                        destination_slot=destination_slot,
+                    )
+                )
+
+        return copies
+
+    def _copy_tree_accepted_path_kv_slots(
+        self,
+        slot_copies: list[TreeAcceptedPathSlotCopy],
+    ) -> None:
+        if not slot_copies:
+            return
+
+        seen_cache_ids: set[tuple[int, ...]] = set()
+        for kv_cache in self.kv_caches:
+            if not isinstance(kv_cache, (tuple, list)):
+                continue
+
+            cache_tensors = tuple(t for t in kv_cache if torch.is_tensor(t))
+            if not cache_tensors:
+                continue
+
+            cache_id = tuple(t.data_ptr() for t in cache_tensors)
+            if cache_id in seen_cache_ids:
+                continue
+            seen_cache_ids.add(cache_id)
+
+            for cache_tensor in cache_tensors:
+                if cache_tensor.ndim < 2:
+                    continue
+
+                block_size = cache_tensor.shape[1]
+                src_blocks = torch.tensor(
+                    [copy.source_slot // block_size for copy in slot_copies],
+                    dtype=torch.long,
+                    device=cache_tensor.device,
+                )
+                src_offsets = torch.tensor(
+                    [copy.source_slot % block_size for copy in slot_copies],
+                    dtype=torch.long,
+                    device=cache_tensor.device,
+                )
+                dst_blocks = torch.tensor(
+                    [copy.destination_slot // block_size for copy in slot_copies],
+                    dtype=torch.long,
+                    device=cache_tensor.device,
+                )
+                dst_offsets = torch.tensor(
+                    [copy.destination_slot % block_size for copy in slot_copies],
+                    dtype=torch.long,
+                    device=cache_tensor.device,
+                )
+
+                gathered = cache_tensor[src_blocks, src_offsets].clone()
+                cache_tensor[dst_blocks, dst_offsets] = gathered
+
+    def _maybe_dump_tree_kv_materialize_trace(
+        self,
+        slot_copies: list[TreeAcceptedPathSlotCopy],
+    ) -> None:
+        trace_path = os.getenv(_TREE_KV_MATERIALIZE_TRACE_ENV)
+        if not trace_path:
+            return
+
+        round_index = getattr(self, "_tree_kv_materialize_trace_round", 0)
+        max_steps = int(os.getenv("VLLM_ASCEND_TREE_KV_MATERIALIZE_TRACE_STEPS", "32"))
+        if round_index >= max_steps:
+            return
+
+        payload = {
+            "step": round_index,
+            "pid": os.getpid(),
+            "copies": [
+                {
+                    "request_index": copy.request_index,
+                    "runtime_node_index": copy.runtime_node_index,
+                    "token_id": copy.token_id,
+                    "position": copy.position,
+                    "source_row_index": copy.source_row_index,
+                    "source_slot": copy.source_slot,
+                    "destination_slot": copy.destination_slot,
+                }
+                for copy in slot_copies
+            ],
+            "num_kv_caches": len(self.kv_caches),
+        }
+        with open(trace_path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._tree_kv_materialize_trace_round = round_index + 1
+
+    def _materialize_tree_accepted_path_kv(
+        self,
+        spec_decode_metadata,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> None:
+        slot_copies = self._plan_tree_accepted_path_slot_copies(
+            spec_decode_metadata,
+            common_attn_metadata,
+        )
+        self._maybe_dump_tree_kv_materialize_trace(slot_copies)
+        self._copy_tree_accepted_path_kv_slots(slot_copies)
+
+    def _patch_tree_spec_decode_positions(self, positions: torch.Tensor, spec_decode_metadata) -> None:
+        if not hasattr(spec_decode_metadata, "runtime"):
+            return
+        if positions.ndim != 1:
+            return
+
+        runtime = spec_decode_metadata.runtime
+        rows_per_request = runtime.node_count + 1
+        request_base_positions = positions[::rows_per_request]
+        depth_offsets = torch.tensor(
+            (0, *build_tree_query_depth_offsets(runtime)),
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        expanded_positions = (
+            request_base_positions.unsqueeze(1) + depth_offsets.unsqueeze(0)
+        ).reshape(-1)
+        positions[: expanded_positions.shape[0]] = expanded_positions
+
+    def _patch_tree_spec_decode_attn_metadata(self, attn_metadata, spec_decode_metadata) -> None:
+        if not hasattr(spec_decode_metadata, "runtime"):
+            return
+
+        runtime = spec_decode_metadata.runtime
+        tree_mask = build_tree_target_attn_mask(runtime)
+        tree_impl = resolve_tree_fast_impl(os.getenv("VLLM_ASCEND_TREE_FAST_IMPL", "batched"))
+
+        def _requires_tree_fast_fallback(actual_seq_lengths_q) -> bool:
+            if not actual_seq_lengths_q:
+                return False
+            tree_rows = int(tree_mask.shape[0])
+            q_start = 0
+            for q_end in actual_seq_lengths_q:
+                q_len = q_end - q_start
+                if q_len > tree_rows:
+                    return True
+                q_start = q_end
+            return False
+
+        def _build_shared_non_root_plan(metadata_dict) -> object | None:
+            first_metadata_item = next(iter(metadata_dict.values()), None)
+            if first_metadata_item is None:
+                return None
+            if getattr(first_metadata_item, "block_tables", None) is None:
+                return None
+            actual_seq_lengths_q = getattr(first_metadata_item, "actual_seq_lengths_q", None)
+            seq_lens_list = getattr(first_metadata_item, "seq_lens_list", None)
+            if not actual_seq_lengths_q or not seq_lens_list:
+                return None
+            if _requires_tree_fast_fallback(actual_seq_lengths_q):
+                return None
+            device = (
+                first_metadata_item.slot_mapping.device
+                if getattr(first_metadata_item, "slot_mapping", None) is not None
+                else self.device
+            )
+            return build_tree_paged_plan(
+                block_tables=first_metadata_item.block_tables,
+                seq_lens=seq_lens_list[: len(actual_seq_lengths_q)],
+                actual_seq_lengths_q=actual_seq_lengths_q,
+                tree_mask=tree_mask,
+                device=device,
+                block_size=self.vllm_config.cache_config.block_size,
+            )
+
+        def _build_shared_all_rows_plan(metadata_dict) -> object | None:
+            first_metadata_item = next(iter(metadata_dict.values()), None)
+            if first_metadata_item is None:
+                return None
+            if getattr(first_metadata_item, "block_tables", None) is None:
+                return None
+            actual_seq_lengths_q = getattr(first_metadata_item, "actual_seq_lengths_q", None)
+            seq_lens_list = getattr(first_metadata_item, "seq_lens_list", None)
+            if not actual_seq_lengths_q or not seq_lens_list:
+                return None
+            if _requires_tree_fast_fallback(actual_seq_lengths_q):
+                return None
+            device = (
+                first_metadata_item.slot_mapping.device
+                if getattr(first_metadata_item, "slot_mapping", None) is not None
+                else self.device
+            )
+            return build_tree_paged_plan(
+                block_tables=first_metadata_item.block_tables,
+                seq_lens=seq_lens_list[: len(actual_seq_lengths_q)],
+                actual_seq_lengths_q=actual_seq_lengths_q,
+                tree_mask=tree_mask,
+                device=device,
+                block_size=self.vllm_config.cache_config.block_size,
+                include_row0=True,
+            )
+
+        def _patch_single(metadata_item, shared_non_root_plan, shared_all_rows_plan) -> None:
+            mask = getattr(metadata_item, "attn_mask", None)
+            if mask is None:
+                metadata_item.attn_mask = tree_mask.to(self.device)
+            else:
+                patched_mask = mask.clone()
+                patched_mask[: tree_mask.shape[0], : tree_mask.shape[1]] = tree_mask.to(
+                    device=patched_mask.device,
+                    dtype=patched_mask.dtype,
+                )
+                metadata_item.attn_mask = patched_mask
+            metadata_item.tree_fast_non_root_plan = shared_non_root_plan
+            metadata_item.tree_fast_all_rows_plan = shared_all_rows_plan
+            metadata_item.tree_fast_non_root_plan_key = None
+            metadata_item.tree_fast_mixed_batch_fallback = _requires_tree_fast_fallback(
+                getattr(metadata_item, "actual_seq_lengths_q", None)
+            )
+
+        if isinstance(attn_metadata, list):
+            for ubatch_metadata in attn_metadata:
+                shared_non_root_plan = (
+                    _build_shared_non_root_plan(ubatch_metadata) if tree_impl == "batched_legacy" else None
+                )
+                shared_all_rows_plan = _build_shared_all_rows_plan(ubatch_metadata) if tree_impl == "batched" else None
+                for metadata_item in ubatch_metadata.values():
+                    _patch_single(metadata_item, shared_non_root_plan, shared_all_rows_plan)
+            return
+
+        shared_non_root_plan = _build_shared_non_root_plan(attn_metadata) if tree_impl == "batched_legacy" else None
+        shared_all_rows_plan = _build_shared_all_rows_plan(attn_metadata) if tree_impl == "batched" else None
+        for metadata_item in attn_metadata.values():
+            _patch_single(metadata_item, shared_non_root_plan, shared_all_rows_plan)
+
     def _correct_optimistic_seq_lens_cpu(self, num_reqs: int) -> None:
         """Correct ``optimistic_seq_lens_cpu`` for async spec-decode drift.
 
@@ -1681,6 +2643,11 @@ class NPUModelRunner(GPUModelRunner):
             # Stash for GPU-side correction in _prepare_inputs.
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+        self._maybe_dump_tree_state_trace(
+            phase="copy_valid_sampled_token_count",
+            next_token_ids=next_token_ids,
+            valid_sampled_tokens_count=valid_sampled_tokens_count,
+        )
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
@@ -1891,6 +2858,12 @@ class NPUModelRunner(GPUModelRunner):
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[token_indices]
+            if getattr(spec_decode_metadata, "runtime", None) is not None:
+                assert common_attn_metadata is not None
+                self._materialize_tree_accepted_path_kv(
+                    spec_decode_metadata,
+                    common_attn_metadata,
+                )
             assert self.drafter is not None
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
@@ -2220,6 +3193,18 @@ class NPUModelRunner(GPUModelRunner):
                         num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
                     )
 
+                tree_linear_positions = None
+                if spec_decode_metadata is not None and hasattr(spec_decode_metadata, "runtime"):
+                    tree_linear_positions = self.positions[: logits_indices.shape[0]].clone()
+                    # Tree target execution needs depth-based semantic
+                    # positions for RoPE/input_positions, but must preserve
+                    # the already-computed linear slot_mapping so sibling
+                    # branches keep distinct physical KV slots.
+                    self._patch_tree_spec_decode_positions(
+                        self.positions[: logits_indices.shape[0]],
+                        spec_decode_metadata,
+                    )
+
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
@@ -2235,7 +3220,18 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
+                    force_tree_prefill=spec_decode_metadata is not None and hasattr(spec_decode_metadata, "runtime"),
                 )
+                if spec_decode_metadata is not None and hasattr(spec_decode_metadata, "runtime"):
+                    self._patch_tree_spec_decode_attn_metadata(attn_metadata, spec_decode_metadata)
+                    self._maybe_dump_tree_target_trace(
+                        phase="post_metadata_patch",
+                        spec_decode_metadata=spec_decode_metadata,
+                        positions=self.positions[: logits_indices.shape[0]],
+                        common_attn_metadata=spec_decode_common_attn_metadata,
+                        attn_metadata=attn_metadata,
+                        linear_positions=tree_linear_positions,
+                    )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2256,6 +3252,17 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded,
                 intermediate_tensors,
             )
+
+            if spec_decode_metadata is not None and hasattr(spec_decode_metadata, "runtime"):
+                self._maybe_dump_tree_target_trace(
+                    phase="pre_model_forward",
+                    spec_decode_metadata=spec_decode_metadata,
+                    positions=positions,
+                    input_ids=input_ids,
+                    common_attn_metadata=spec_decode_common_attn_metadata,
+                    attn_metadata=attn_metadata,
+                    advance_round=True,
+                )
 
             # update global cos, sin
             update_cos_sin(positions)
@@ -2299,6 +3306,7 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
+                positions=positions,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
             self.maybe_get_kv_connector_output(
@@ -2380,6 +3388,7 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 aux_hidden_states,
                 attn_metadata,
+                input_ids,
                 positions,
                 ec_connector_output,
                 cudagraph_stats,
@@ -2430,6 +3439,7 @@ class NPUModelRunner(GPUModelRunner):
             sample_hidden_states,
             aux_hidden_states,
             attn_metadata,
+            input_ids,
             positions,
             ec_connector_output,
             cudagraph_stats,
@@ -2448,7 +3458,23 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            self.tree_terminal_row_indices = None
+            self.tree_accepted_paths = None
             sampler_output = self._sample(logits, spec_decode_metadata)
+            self._maybe_dump_sample_trace(
+                logits=logits,
+                sample_hidden_states=sample_hidden_states,
+                sampler_output=sampler_output,
+                spec_decode_metadata=spec_decode_metadata,
+            )
+            self._maybe_dump_tree_row0_isolated_trace(
+                logits=logits,
+                sample_hidden_states=sample_hidden_states,
+                spec_decode_metadata=spec_decode_metadata,
+                attn_metadata=attn_metadata,
+                input_ids=input_ids,
+                positions=positions,
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2719,6 +3745,10 @@ class NPUModelRunner(GPUModelRunner):
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
+            self._maybe_dump_tree_state_trace(
+                phase="bookkeeping_async_after_prev_req_cache",
+                sampled_token_ids=sampled_token_ids,
+            )
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -3025,6 +4055,7 @@ class NPUModelRunner(GPUModelRunner):
         ubatch_slices: UBatchSlices | None = None,
         logits_indices: torch.Tensor | None = None,
         use_spec_decode: bool = False,
+        force_tree_prefill: bool = False,
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
@@ -3198,6 +4229,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
+            tree_spec_decode_enabled=force_tree_prefill,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

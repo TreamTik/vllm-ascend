@@ -1,8 +1,10 @@
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.rejection_sampler import (
     expand_batch_to_tokens,
     expand_pytorch,
@@ -12,6 +14,9 @@ from vllm_ascend.sample.rejection_sampler import (
     sample_recovered_tokens_blockwise_pytorch,
     sample_recovered_tokens_pytorch,
 )
+from vllm_ascend.spec_decode.tree_execution import build_tree_spec_decode_metadata
+from vllm_ascend.spec_decode.tree_runtime import build_spec_tree_runtime
+from vllm_ascend.spec_decode.tree_verifier import pack_tree_output_tokens
 
 # Global constants
 PLACEHOLDER_TOKEN_ID = -1
@@ -933,3 +938,108 @@ class TestEntropyVerify(TestBase):
         assert output_token_ids[0, 0].item() == 1
         assert output_token_ids[0, 1].item() in (0, 88)
         assert output_token_ids[0, 2].item() == 100
+
+
+def test_tree_output_tokens_pack_to_existing_layout():
+    accepted = (
+        type("Accepted", (), {"token_ids": (7, 8), "bonus_token_id": 9}),
+    )
+
+    packed = pack_tree_output_tokens(accepted, max_path_len=2, placeholder_token_id=-1)
+
+    assert packed.shape == (1, 3)
+    assert packed.tolist() == [[7, 8, 9]]
+
+
+def test_tree_sampler_forward_returns_existing_packed_tensor_shape():
+    runtime = build_spec_tree_runtime(((0,), (1,), (0, 0), (0, 1), (0, 1, 0), (1, 0)))
+    metadata = build_tree_spec_decode_metadata(runtime, batch_size=1)
+    object.__setattr__(metadata, "draft_token_ids", torch.tensor([11, 12, 21, 22, 31, 41], dtype=torch.int32))
+    object.__setattr__(metadata, "num_draft_tokens", [6])
+    object.__setattr__(metadata, "cu_num_draft_tokens", torch.tensor([6], dtype=torch.int32))
+    object.__setattr__(metadata, "target_logits_indices", torch.arange(6, dtype=torch.int32))
+    object.__setattr__(metadata, "bonus_logits_indices", torch.tensor([6], dtype=torch.int32))
+    object.__setattr__(metadata, "logits_indices", torch.arange(7, dtype=torch.int32))
+
+    sampler = AscendRejectionSampler.__new__(AscendRejectionSampler)
+    sampler.sampler = lambda **kwargs: type(
+        "BonusOut",
+        (),
+        {"sampled_token_ids": torch.tensor([[101]], dtype=torch.int32), "logprobs_tensors": None},
+    )()
+    sampler.top_k = None
+    sampler.is_processed_logprobs_mode = False
+
+    logits = torch.full((7, 128), -1.0, dtype=torch.float32)
+    logits[0, 11] = 1.0
+    logits[1, 12] = 1.0
+    logits[2, 21] = 1.0
+    logits[3, 22] = 1.0
+    logits[4, 31] = 1.0
+    logits[5, 99] = 1.0
+    logits[6, 101] = 1.0
+
+    sampling_metadata = type(
+        "SamplingMetadataStub",
+        (),
+            {
+                "no_penalties": True,
+                "bad_words_token_ids": None,
+                "allowed_token_ids_mask": None,
+                "output_token_ids": [],
+                "spec_token_ids": None,
+                "logitsprocs": type("LogitsProcsStub", (), {"non_argmax_invariant": []})(),
+                "all_greedy": True,
+            },
+        )()
+
+    output = AscendRejectionSampler.forward(
+        sampler,
+        metadata=metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=sampling_metadata,
+    )
+
+    assert output.sampled_token_ids.shape == (1, 4)
+    assert output.sampled_token_ids.tolist() == [[11, 22, 31, 101]]
+
+
+def test_tree_sampler_forward_rejects_non_greedy_mode():
+    runtime = build_spec_tree_runtime(((0,),))
+    metadata = build_tree_spec_decode_metadata(runtime, batch_size=1)
+    object.__setattr__(metadata, "draft_token_ids", torch.tensor([11], dtype=torch.int32))
+    object.__setattr__(metadata, "num_draft_tokens", [1])
+    object.__setattr__(metadata, "cu_num_draft_tokens", torch.tensor([1], dtype=torch.int32))
+    object.__setattr__(metadata, "target_logits_indices", torch.tensor([0], dtype=torch.int32))
+    object.__setattr__(metadata, "bonus_logits_indices", torch.tensor([1], dtype=torch.int32))
+    object.__setattr__(metadata, "logits_indices", torch.tensor([0, 1], dtype=torch.int32))
+
+    sampler = AscendRejectionSampler.__new__(AscendRejectionSampler)
+    sampler.sampler = lambda **kwargs: None
+    sampler.top_k = None
+    sampler.is_processed_logprobs_mode = False
+
+    logits = torch.zeros((2, 32), dtype=torch.float32)
+    sampling_metadata = type(
+        "SamplingMetadataStub",
+        (),
+        {
+            "no_penalties": True,
+            "bad_words_token_ids": None,
+            "allowed_token_ids_mask": None,
+            "output_token_ids": [],
+            "spec_token_ids": None,
+            "logitsprocs": type("LogitsProcsStub", (), {"non_argmax_invariant": []})(),
+            "all_greedy": False,
+        },
+    )()
+
+    with pytest.raises(NotImplementedError, match="greedy"):
+        AscendRejectionSampler.forward(
+            sampler,
+            metadata=metadata,
+            draft_probs=None,
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+        )
